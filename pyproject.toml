@@ -10,6 +10,9 @@ dependencies = [
   "pydantic-settings>=2.10.1,<3.0.0",
   "openai>=1.60.0",
   "httpx>=0.27.0",
+  "pillow>=11,<12",
+  "pillow-heif>=0.18",
+  "numpy>=2.0",
 ]
 
 [dependency-groups]
@@ -59,7 +62,7 @@ addopts = [
   "-p", "no:logging",
   "--cov=src/food_vision",
   "--cov-report=term-missing",
-  "--cov-fail-under=60",
+  "--cov-fail-under=85",  # doc floor for prestudy/observation/imaging/domain (§9); global coverage is higher in practice
 ]
 markers = [
   "unit: no external dependencies",

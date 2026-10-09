@@ -1,839 +1,764 @@
-# Pre-study Implementation Concept — Web UI (Appendix A, Phase P)
+# Pre-study Implementation Concept — Phase P (hybrid CLI + web UI)
 
-Status: supersedes the **interface layer** of
-`docs/dev/pre-study-implementation.md` (which was CLI-only). The Appendix A
-*domain* decisions — dataset, strategies, metrics, decision rule — are
-unchanged and are not repeated in full here; see that doc and concept
-§Appendix A for the source of truth. What changes is how a run is
-triggered and where results live: a local FastAPI + SQLite web app
-instead of a `food-vision bench` CLI command, because the actual need is
-persisted, queryable evidence and publication-quality charts, not just a
-one-off batch sweep.
+**Status:** implementation spec for concept Appendix A. Self-contained: no
+rule in this document depends on an earlier revision or on git history.
+**Supersedes:** `docs/dev/pre-study-implementation.md` (CLI-only plan) in
+full. That file is kept for history only.
+**Scope:** single whole fruit, edible grams, model selection. Nothing from
+Phase 0+ (matching, enrichment, ranges, reference store, meal API).
 
-This revision folds in two review passes:
+## 1. Goal, research questions, exit criterion
 
-1. A pre-implementation review against the actual `OpenRouterClient`
-   implementation (fixes applied directly to `proxy/openrouter.py`; see
-   §12 for the log).
-2. An external methodology/engineering review (scored 6.5/10: research
-   validity 8, reproducibility 5, data model 6, engineering 6,
-   proportionality 5) arguing the plan stores *what was asked for, not
-   what was returned*, is missing a parent "sweep" object above
-   `run_batches`, under-specifies the independent variables worth
-   controlling, and should be checked against Inspect AI before more
-   custom engineering goes in. That check happened (§13) and the decision
-   was to **keep the custom build** and absorb the review's missing
-   fields (§7, §8, §9) rather than adopt an external harness — recorded
-   here so the trade-off isn't silently lost.
+**Goal.** Select a default and a fallback vision model, and a prompting
+strategy, on test-set evidence that would survive peer review. Or establish
+that no model perceives fruit size well enough, and stop.
 
-## 1. Why the interface changed
+**Research questions** (pre-registered; RQ1 decides, the rest inform):
 
-CLI-only was the right default for "run a sweep, read a markdown report."
-It stopped being the right choice once the real requirement surfaced:
+| ID | Question | Analysis |
+|---|---|---|
+| RQ1 | Which model/strategy estimates edible grams best, and is it better than knowing only the fruit type? | §6.3 decision rule |
+| RQ2 | Does the model perceive size, or answer from a type prior? | size slope β (§6.2) |
+| RQ3 | Does "measure dimensions, compute in code" (S2) beat "estimate grams" (S1)? | paired S2−S1 per model |
+| RQ4 | Does the reference card help? | paired c3−c2 per model |
+| RQ5 | Does stating a prior (S3) help, or flatten β? | paired S3−S1, Δβ |
+| RQ6 | Does reasoning (provider default vs off) change accuracy, cost, latency? | secondary arm, top-2 models |
 
-- Every run (not just a final frozen sweep) needs to be **persisted and
-  queryable** — flat JSON-per-sweep files don't support "show me all S2
-  runs on bananas across every model I've tried so far."
-- Params (model, provider pin, quantization, strategy, temperature,
-  resolution, repeats) need to be **chosen interactively**, including
-  outside the frozen protocol, for exploration before/around the frozen
-  test-split run.
-- Charts must be **reusable in a paper** — static, high-DPI, reproducible
-  from stored history, not just printed to a terminal or a one-off script.
+**Exit.** `bench/reports/prestudy-v1/` contains the frozen protocol, the
+analysis results JSON, tables and charts, and a written decision. The
+decision is either (default, fallback, strategy) or "stop: no eligible
+model".
 
-A database + a small local web UI solves this proportionately; a full
-FastAPI *service* in the production sense is not what this is — see §3 for
-the explicit boundary with the concept's future `api/`.
-
-## 2. Still explicitly out of scope
-
-Unchanged from the CLI plan's §2 non-goals — restated because the web UI
-shape makes it tempting to reach for more:
-
-- No `matching/`, `enrichment/`, ranges (`low/mid/high`) — single fruit,
-  point estimates only.
-- No real `reference/` (BLS/FDC/OFF) build pipeline — a 6–8-row kcal/
-  density/edible-ratio lookup (`bench/fruit_reference.py`) is enough.
-- No multi-user auth, no remote exposure — **localhost only**. This is a
-  personal research tool, not a deployment. Document this explicitly in
-  the README; do not add CORS/auth scaffolding that implies otherwise.
-- No durable job queue (Celery/RQ/etc.) — FastAPI `BackgroundTasks` is
-  enough at this volume and concurrency (one researcher, one process).
-- No SQLAlchemy/SQLModel — stdlib `sqlite3` is enough even at the larger
-  row counts this revision implies (§7); an ORM would be a dependency
-  with no payoff here.
-- No adoption of Inspect AI / promptfoo as the execution engine — evaluated
-  in §13, decision was to keep this system self-contained.
-
-## 3. Namespace: kept out of the future production `api/`
-
-Concept §13 reserves `food_vision/api/{app.py,meals.py,foods.py}` for the
-real Phase 0+ meal-analysis service. This tool is a different thing
-(a research/benchmark instrument) and must not collide with that path
-once Phase 0 starts. It lives under a new `food_vision.bench` package,
-served at `/prestudy`, with its own Uvicorn entry point:
+## 2. Approach: hybrid, one core, two front-ends
 
 ```text
-uvicorn food_vision.bench.web.app:create_app --factory --port 8800
+                 ┌───────────────────────── food_vision.prestudy ─────────────────────────┐
+  CLI (typer)    │ dataset · fits · configs · protocols · sweeps · executor · analysis   │   Web UI (FastAPI, 127.0.0.1)
+  batch work ───►│                     ▲                          │                       │◄── interactive work
+  import, fit,   │                     │                          ▼                       │    probe one image,
+  freeze, run,   │            observation.adapter  ───►  proxy.OpenRouterClient          │    browse sweeps/attempts,
+  resume,        │            imaging.preprocess / covariates                             │    human review,
+  analyze        │                     │                                                  │    view analysis + charts
+                 │                     ▼                                                  │
+                 │          SQLite var/prestudy/prestudy.db (WAL)                         │
+                 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-`food_vision.bench` holds **code** (domain + persistence + web), while the
-existing top-level `bench/` directory keeps holding **data/output**
-(`bench/sets/`, `bench/reports/`) — same distinction already called out
-in the CLI plan's §3, still true here.
+| Concern | CLI | Web UI |
+|---|---|---|
+| Dataset import, fits, protocol freeze | yes | no |
+| Sweep create / estimate / run / resume | yes | read-only progress |
+| Test-split anything | yes (protocol sweeps only) | **never** (test images not addressable) |
+| Single-image probe (dev or ad-hoc upload, ≤3 models) | no | yes |
+| Attempt explorer, raw response, human review | no | yes |
+| Analysis run + chart export | yes | renders stored results; can trigger dev-only exploratory analysis |
 
-## 4. Package layout
+Rationale: long sweeps must not live inside a web request worker (reloads
+kill them, `BackgroundTasks` has no resume). Interactive probing and visual
+review need a browser. Both call the same service functions; neither
+front-end contains logic.
 
-```text
-src/food_vision/
-├── observation/
-│   ├── __init__.py
-│   ├── schema.py                # strict JSON schema per strategy (S1/S2/S3)
-│   ├── adapter.py                # builds multimodal message, calls OpenRouterClient
-│   └── prompts/
-│       ├── observe_fruit_s1_v1_en.md
-│       ├── observe_fruit_s2_v1_en.md
-│       ├── observe_fruit_s3_v1_en.md
-│       └── ...                   # one file per (strategy, version, language) — §7.4
-├── domain/
-│   ├── __init__.py
-│   └── calculator.py              # pure S2 formulas, kcal_from_edible_g
-├── imaging/
-│   ├── __init__.py
-│   ├── preprocess.py              # decode, resize/normalize, strip EXIF, re-encode
-│   └── covariates.py              # extract phone/focal-length/etc. from EXIF BEFORE stripping
-└── bench/
-    ├── __init__.py
-    ├── db.py                       # sqlite3 connection-per-call helpers, schema, queries
-    ├── dataset.py                  # fruit-v1 manifest import -> samples rows
-    ├── sweeps.py                   # NEW: sweep creation, environment snapshot capture
-    ├── runs.py                     # batch lifecycle, repeat execution, baselines
-    ├── fruit_reference.py          # tiny kcal/density/edible-ratio lookup
-    ├── calculator_fits.py          # stores/looks up fitted S2 constants per experiment
-    ├── prior_values.py             # dev-only S3 prior provenance
-    ├── metrics.py                  # MAPE, Spearman, Bland-Altman, ICC, median APE, R^2, CCC, bootstrap CI
-    ├── charts.py                   # matplotlib SVG+PNG export from stored history
-    └── web/
-        ├── __init__.py
-        ├── app.py                  # create_app(), lifespan, routes, DI
-        ├── templates/
-        │   ├── base.html
-        │   ├── new_sweep.html        # NEW: define a sweep's fixed env/prompt/schema
-        │   ├── new_run.html         # upload + param form (within a sweep)
-        │   ├── batch_status.html    # polling page for a running batch
-        │   ├── history.html         # queryable run list/filter + test-split counters
-        │   └── charts.html          # chart gallery + download links
-        └── static/
-            └── prestudy.css
+## 3. Out of scope
 
-data/
-└── fruit_kcal_100g.csv             # bls_code -> kcal_100g, density_g_cm3, edible_ratio
+- Matching, enrichment, ranges, BLS/FDC/OFF pipeline (a CSV of 6–8 fruit
+  rows suffices), meal API under `food_vision/api/`.
+- Auth, remote exposure, CORS. The web UI binds `127.0.0.1` only.
+- Job queues, ORMs, pandas/scipy. `numpy` is used directly (already a
+  transitive dependency of matplotlib).
+- Inspect AI / promptfoo as engine. They don't offer a frozen-protocol
+  guard, specimen-level statistics or an interactive probe; the
+  content-addressed config store (§5) covers their reproducibility value.
 
-var/prestudy/                        # gitignored: runtime state, not source
-├── prestudy.db                      # sqlite3 file (WAL mode)
-├── uploads/                          # raw uploaded images, content-hashed filenames
-└── normalized/                       # preprocessed derivatives used for the actual call
+## 4. Experimental design
 
-bench/
-├── sets/fruit-v1/{manifest.jsonl,README.md}   # tracked; images outside git
-└── reports/prestudy-web/charts/     # chart-{id}-{kind}.{svg,png}, tracked once curated
-```
+### 4.1 Dataset `fruit-v1`
 
-Notes:
+| Item | Value |
+|---|---|
+| Fruit types | banana, apple, orange, pear, kiwi, mandarin |
+| Specimens per type | **8**, chosen to span smallest → largest available |
+| Conditions per specimen | c1 top-down + card · c2 45° + card · c3 45° no card |
+| Images | 6 × 8 × 3 = **144** |
+| Split (by specimen) | dev **3**/type (size ranks 2, 5, 7) · test **5**/type (ranks 1, 3, 4, 6, 8) |
+| Test set | 30 specimens, 90 images |
 
-- `imaging/covariates.py` is new (external review: phone model, focal
-  length, capture distance, lighting, background, scale device/resolution
-  are "cheap to record now and impossible to reconstruct later"). It runs
-  **before** `preprocess.py` strips EXIF, writes the extracted fields to
-  `samples` (§7.2), and the raw EXIF bytes are never sent to a model and
-  never leave the local DB.
-- `bench/sweeps.py` is new — captures the per-sweep environment snapshot
-  (§7.3) once per sweep, not once per batch.
-- Package data (`observation/prompts/*.md`, `bench/web/templates/*.html`,
-  `bench/web/static/*.css`) is included automatically by `uv_build`'s
-  default "everything under `src/food_vision/`" packaging — verify with
-  `uv build --no-sources` once these files exist; no extra
-  `[tool.uv_build]` config expected to be needed.
+Why 8 per type: with the original 3 test specimens per type, within-type
+statistics are degenerate (Spearman ρ can only take a handful of values)
+and specimen-clustered CIs are uninformative. With 30 test specimens and a
+typical APE SD of ~0.15, the 95% CI half-width on MAPE is about ±5 pp;
+paired model differences are tighter. Differences below ~5 pp are reported
+as unresolved, not as wins.
 
-## 5. Dependencies added
+**Capture protocol.**
+- Same phone, same neutral board, daylight, no zoom, 30–40 cm.
+- ID-1 card (85.60 × 53.98 mm), flat, fully visible, blank side up.
+- No cropping. HEIC accepted (decoded via `pillow-heif`).
+- One capture session per day; the session sheet records lighting,
+  background, distance, phone and scale.
 
-```toml
-dependencies = [
-  # existing: pydantic, pydantic-settings, openai, httpx
-  "fastapi>=0.115.0,<1.0.0",
-  "uvicorn[standard]>=0.32.0,<1.0.0",
-  "python-multipart>=0.0.12",   # multipart/form-data upload parsing
-  "jinja2>=3.1.0,<4.0.0",
-  "pillow>=11.0.0,<12.0.0",      # decode/resize/EXIF-read-then-strip, decompression-bomb guard
-  "matplotlib>=3.9.0,<4.0.0",    # Agg backend, SVG+PNG chart export
-]
-```
+**Ground truth per specimen.**
+- `whole_g`, and `waste_g` (weighed after peeling/coring);
+  `edible_g = whole_g − waste_g`.
+- `length_cm`, `max_diameter_cm` (banana: outer curve + mid diameter).
+- `bls_code`, `kcal_100g` (BLS 4.0); `kcal_ref = edible_g × kcal_100g / 100`.
+- `scale_model`, `scale_resolution_g` (≤1 g required).
 
-Deliberately **not** added: SQLAlchemy/SQLModel, pandas/scipy/seaborn (the
-expanded metrics in §9 are still implementable with plain
-`statistics`/hand-rolled rank-correlation, Bland–Altman, and ICC — these
-are closed-form/small-N computations, not a `pandas` justification by
-themselves), HTMX/any JS framework, Inspect AI/promptfoo (§13).
+**Manifest.** `bench/sets/fruit-v1/specimens.csv` (one row per specimen,
+ground truth + split + size rank) and `bench/sets/fruit-v1/images.csv` (one
+row per image: specimen key, condition, filename, session id).
+`bench/sets/fruit-v1/sessions.csv` holds the capture-session covariates.
+All three are tracked; images are not. The dataset version is the sha256
+of the three files concatenated in that order.
 
-## 6. Settings additions (additive only, `config/settings.py`)
+### 4.2 Factors: what varies, what is fixed
 
-```python
-PRESTUDY_DB_PATH: Path = Path("var/prestudy/prestudy.db")
-PRESTUDY_UPLOAD_DIR: Path = Path("var/prestudy/uploads")
-PRESTUDY_NORMALIZED_DIR: Path = Path("var/prestudy/normalized")
-PRESTUDY_MAX_UPLOAD_BYTES: int = 15 * 1024 * 1024       # 15 MB
-PRESTUDY_MAX_DECODED_PIXELS: int = 40_000_000            # decompression-bomb guard
-```
+Every parameter is **recorded** (§5). Only these are **varied** in Phase P:
 
-No directories are created at import time or at `Settings()` construction
-— creation happens once, in the app's `lifespan`.
+| Factor | Levels | Where |
+|---|---|---|
+| Model | 6–8 candidates (§4.4) | primary |
+| Strategy | S1, S2, S3 (+ B0, B1 computed, no calls) | primary |
+| Condition | c1, c2, c3 (a property of the image) | primary |
+| Reasoning | `off` vs provider default | secondary, top-2 models, test c2 only |
+| Resolution | 1024 vs 768 px | secondary, top-2 models, test c2 only |
+| Views | c2 alone vs c1+c2 in one request | secondary, top-2 models |
 
-This plan relies on `OpenRouterClient.complete()` accepting per-call
-`temperature`, `seed`, and a `routing_policy: RoutingPolicy`
-(`provider_pin` required for `RoutingMode.BENCHMARK`, `quantizations`/
-`zdr`/`data_collection` optional overrides) — **already implemented**.
-This revision adds a further requirement, not yet implemented in
-`proxy/openrouter.py` (listed as outstanding in §12's new row): extending
-`complete()`/`CompletionResult` to accept `top_p`, `max_tokens`, a
-`reasoning` config (`effort: none|minimal|low|medium|high` or a token
-budget, plus `exclude`), and a `structured_output_mode` switch
-(`json_schema`/`tool_call`/`json_object`), and to **surface** on
-`CompletionResult` what OpenRouter actually returned: `model_resolved`,
-`system_fingerprint`, `generation_id`, `native_finish_reason`,
-`reasoning_tokens`, `cached_tokens`, and whether a sent `seed` was
-honoured (OpenRouter sometimes drops it silently — the only way to know
-is to compare what was sent to what the provider's response implies, and
-providers don't uniformly echo this back, so `seed_honoured` will often
-have to be `NULL`/unknown rather than a confident boolean). This is a
-proxy-layer change, out of scope for this doc to implement, but the data
-model in §7 assumes it exists.
+Fixed at defaults for all primary arms (changeable only in exploratory
+dev sweeps, never pooled with protocol results):
 
-## 7. Data model (SQLite, stdlib `sqlite3`)
+| Parameter | Value |
+|---|---|
+| `temperature` | `0`, or `null` (provider default) where the endpoint rejects 0; whichever is used is part of the arm |
+| `top_p`, `seed` | unset / `20261009` |
+| `max_tokens` | 2,048 (headroom for reasoning-by-default models) |
+| `reasoning` | provider default (recorded); `off` only in the secondary arm |
+| `structured_output_mode` | `json_schema` strict; `json_object` only for models without strict support (per-model capability, §7.3) |
+| Repair on invalid output | **disabled** in protocol arms (measures capability, not our parser) |
+| Image | JPEG q90, long edge 1024 px, EXIF-transposed then stripped, `detail` unset |
+| Prompt | English, user message, persona line on, card dimensions stated, `observations` field before the answer, no confidence field |
+| Routing | one pinned provider per model, `allow_fallbacks: false`, `zdr: true`, `data_collection: deny`, quantization pinned only for open-weight models |
+| Repeats | 3 |
 
-Why raw `sqlite3` over SQLAlchemy/SQLModel: the query surface (insert a
-sweep/batch/attempts, update attempt status, filter/aggregate for charts)
-is small and known up front even with the expanded column set below —
-parameterized SQL plus a `schema_version` table covers it with zero extra
-dependency surface, and keeps the "framework-free utilities" discipline
-already used for logging. Row-count estimate is revised upward from the
-original ~3–4k: a 54-image × 6-model × 3-repeat sweep alone is ~1,000
-attempts, and several sweeps are expected across the study — still
-trivially within SQLite's comfort zone (it scales to tens of millions of
-rows on a single file), so this doesn't change the SQLite-vs-DB-server
-decision, only confirms a `sweeps` parent object is needed to keep that
-volume navigable (external review's "data model" finding).
+If a candidate cannot be served under `zdr: true`, it is either dropped or
+run with `zdr: false` as a documented exception in the protocol file. It is
+never relaxed silently.
 
-### 7.1 Connection handling (unchanged: no shared connection across threads)
+### 4.3 Strategies and baselines
 
-**Do not** open one `sqlite3.connect()` at startup and store it on
-`app.state`. `sqlite3` connections default to `check_same_thread=True`,
-and FastAPI's `BackgroundTasks` (used for `runs.execute_batch`, §8.6) run
-in a thread-pool thread different from the request thread that opened the
-connection — sharing one connection across that boundary raises
-`sqlite3.ProgrammingError` at the first background-task query.
+| ID | Model is asked for | Prediction |
+|---|---|---|
+| S1 | `edible_g` | direct |
+| S2 | `length_cm`, `max_diameter_cm` | `calculator(type, L, D; fit)`; fit from dev specimens only |
+| S3 | `edible_g`, prompt states dev-derived p10–p90 for the type | direct |
+| B0 | — | dev mean `edible_g` per type |
+| B1 | — | `calculator` on **true** tape measurements |
 
-`bench/db.py` provides a connection-per-call context manager (WAL mode,
-`busy_timeout`); the request's `get_db()` dependency and
-`runs.execute_batch`'s background task each open their own connection via
-this helper — never share one. See the original design rationale (still
-valid) in this doc's git history if more detail is needed; unchanged by
-this revision.
+B0 and B1 are computed in the analysis, not executed as sweeps. Fits (S2
+constants, S3 priors, B0 means) are produced once by `prestudy fit` from
+dev specimens, content-hashed, and referenced by hash from every config
+that uses them (§5.2). A fit derived from any test specimen is rejected by
+a CHECK constraint.
 
-### 7.2 Schema
+### 4.4 Candidates
+
+6–8 models: 2–3 frontier (Gemini Flash tier, Claude Sonnet tier, GPT
+tier), 2 economical, 2 open-weight (Qwen3-VL as the general open baseline;
+Food-R1 only if reachable behind the `ModelProvider` Protocol). The list is
+fixed in the protocol file at freeze time after a capability smoke test
+(`prestudy smoke`: image input, strict schema, ZDR route available, one
+call each).
+
+### 4.5 Contamination and human validation
+
+- `fruit-v1` photos are new, so training-set contamination is excluded by
+  construction. The report states this.
+- After each protocol sweep, a stratified 10% sample of attempts (by model ×
+  strategy) is human-reviewed in the web UI: was the right object
+  measured, was the card used, was the output plausible. Inter-rater
+  reliability is not applicable (single reviewer); the report says so.
+
+## 5. Data model (SQLite, stdlib `sqlite3`, WAL)
+
+### 5.1 Principles
+
+- **Content-addressed configuration.** Everything that defines a
+  measurement, except the model and the image, is one canonical JSON
+  `run_config` identified by its sha256. Two results are comparable iff
+  their config hashes are equal. A protocol is a set of
+  (config hash, model, provider) arms. "Protocol-compliant" is a set
+  membership test, not a formula.
+- **Immutable inputs, append-only outputs.** Prompts, schemas, fits,
+  configs and protocols are insert-only and keyed by hash. Attempts are
+  updated only by the executor during their own lifecycle.
+- **Idempotent work items.** A task is unique on
+  (sweep, config, model, provider, image). Creating a sweep twice or
+  resuming it never duplicates work.
+- **Store what was returned, not only what was asked.**
+
+### 5.2 Schema
 
 ```sql
-CREATE TABLE samples (
-    id INTEGER PRIMARY KEY,
-    source TEXT NOT NULL CHECK (source IN ('fruit_v1', 'manual_upload')),
-    image_path TEXT NOT NULL,
-    image_sha256 TEXT NOT NULL,
-    specimen_id TEXT,              -- NULL for manual_upload
-    fruit_type TEXT,
-    condition TEXT,                -- c1/c2/c3, NULL for manual_upload
-    split TEXT,                    -- dev/test, NULL for manual_upload
-    whole_g REAL, edible_g REAL, length_cm REAL, max_diameter_cm REAL,
-    bls_code TEXT, kcal_ref REAL,
-    -- Covariates (external review: "cheap to record now, impossible to
-    -- reconstruct later"). Extracted from EXIF by imaging/covariates.py
-    -- BEFORE imaging/preprocess.py strips EXIF for the outbound request;
-    -- these never leave the local DB.
-    phone_model TEXT,
-    focal_length_mm REAL,
-    capture_distance_cm REAL,       -- manual entry at capture time, not from EXIF
-    lighting TEXT,                   -- controlled vocabulary, e.g. 'daylight'|'indoor_artificial'|'mixed'
-    background TEXT,
-    scale_model TEXT,                -- physical scale used for this sample's ground truth
-    scale_resolution_g REAL,         -- e.g. 1.0, 0.1
-    created_at TEXT NOT NULL
+CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+
+CREATE TABLE datasets (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,                       -- 'fruit-v1'
+  content_sha256 TEXT NOT NULL UNIQUE,      -- §4.1
+  imported_at TEXT NOT NULL
 );
 
-CREATE TABLE experiments (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    manifest_sha256 TEXT,          -- NULL for ad-hoc/manual experiments
-    notes TEXT,
-    created_at TEXT NOT NULL
+CREATE TABLE capture_sessions (
+  id INTEGER PRIMARY KEY,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id),
+  session_key TEXT NOT NULL,
+  phone_model TEXT, lighting TEXT, background TEXT,
+  capture_distance_cm REAL, scale_model TEXT, scale_resolution_g REAL,
+  captured_on TEXT,
+  UNIQUE (dataset_id, session_key)
 );
 
-CREATE TABLE frozen_prompts (
-    id INTEGER PRIMARY KEY,
-    strategy TEXT NOT NULL CHECK (strategy IN ('S1','S2','S3')),
-    prompt_hash TEXT NOT NULL,
-    frozen_at TEXT NOT NULL,
-    UNIQUE (strategy, prompt_hash)
+CREATE TABLE specimens (
+  id INTEGER PRIMARY KEY,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id),
+  specimen_key TEXT NOT NULL,               -- 'banana_03'
+  fruit_type TEXT NOT NULL,
+  split TEXT NOT NULL CHECK (split IN ('dev','test')),
+  size_rank INTEGER NOT NULL,
+  whole_g REAL NOT NULL, waste_g REAL NOT NULL, edible_g REAL NOT NULL,
+  length_cm REAL NOT NULL, max_diameter_cm REAL NOT NULL,
+  bls_code TEXT NOT NULL, kcal_100g REAL NOT NULL, kcal_ref REAL NOT NULL,
+  UNIQUE (dataset_id, specimen_key),
+  CHECK (abs(whole_g - waste_g - edible_g) < 0.5)
 );
 
-CREATE TABLE calculator_fits (
-    id INTEGER PRIMARY KEY,
-    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
-    fruit_type TEXT NOT NULL,
-    param_name TEXT NOT NULL,       -- 'banana_a' | 'density_g_cm3' | 'edible_ratio'
-    value REAL NOT NULL,
-    fitted_on_split TEXT NOT NULL CHECK (fitted_on_split = 'dev'),
-    fitted_at TEXT NOT NULL,
-    notes TEXT,
-    UNIQUE (experiment_id, fruit_type, param_name)
+CREATE TABLE images (
+  id INTEGER PRIMARY KEY,
+  specimen_id INTEGER REFERENCES specimens(id),        -- NULL = ad-hoc upload
+  session_id INTEGER REFERENCES capture_sessions(id),
+  source TEXT NOT NULL CHECK (source IN ('dataset','upload')),
+  condition TEXT CHECK (condition IN ('c1','c2','c3')),
+  raw_path TEXT NOT NULL,
+  raw_sha256 TEXT NOT NULL UNIQUE,
+  exif_make TEXT, exif_model TEXT, exif_focal_mm REAL, exif_focal_35mm REAL,
+  width_px INTEGER NOT NULL, height_px INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (specimen_id, condition)
 );
 
-CREATE TABLE prior_values (
-    id INTEGER PRIMARY KEY,
-    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
-    fruit_type TEXT NOT NULL,
-    p10_g REAL NOT NULL, p50_g REAL NOT NULL, p90_g REAL NOT NULL,
-    source TEXT NOT NULL CHECK (source IN ('dev_specimens', 'external_table')),
-    derived_at TEXT NOT NULL,
-    UNIQUE (experiment_id, fruit_type)
+CREATE TABLE prompts (
+  id INTEGER PRIMARY KEY,
+  strategy TEXT NOT NULL CHECK (strategy IN ('S1','S2','S3')),
+  version INTEGER NOT NULL, language TEXT NOT NULL,
+  text TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE,
+  UNIQUE (strategy, version, language)
 );
 
--- NEW (external review "data model" finding #1): the parent object a
--- batch of batches belongs to. One sweep = one launch sharing the same
--- code version, prompt text, schema version, and settings snapshot —
--- e.g. "54 images x 6 models x 3 repeats" is one sweep containing ~324
--- batches, not 324 unrelated rows with no common anchor. This is also
--- where the ISERN-guideline-style "exact model version and run date,
--- full config" requirement gets satisfied: one row per sweep, not
--- reconstructed after the fact from scattered batch columns.
+CREATE TABLE output_schemas (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL, version INTEGER NOT NULL,
+  json TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE,
+  UNIQUE (name, version)
+);
+
+CREATE TABLE fits (
+  id INTEGER PRIMARY KEY,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id),
+  kind TEXT NOT NULL CHECK (kind IN ('calculator','prior','baseline_b0')),
+  derived_from_split TEXT NOT NULL CHECK (derived_from_split = 'dev'),
+  payload TEXT NOT NULL,                    -- JSON, per fruit type
+  sha256 TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE run_configs (
+  id INTEGER PRIMARY KEY,
+  canonical_json TEXT NOT NULL,             -- §5.3, sorted keys, no whitespace
+  sha256 TEXT NOT NULL UNIQUE,
+  label TEXT                                 -- human name, not part of identity
+);
+
+CREATE TABLE protocols (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,                 -- 'prestudy-v1'
+  toml_text TEXT NOT NULL, sha256 TEXT NOT NULL UNIQUE,
+  dataset_id INTEGER NOT NULL REFERENCES datasets(id),
+  git_sha TEXT NOT NULL,                      -- freeze refused if worktree dirty
+  frozen_at TEXT NOT NULL,
+  supersedes_id INTEGER REFERENCES protocols(id),
+  supersede_reason TEXT,
+  CHECK ((supersedes_id IS NULL) = (supersede_reason IS NULL))
+);
+
+CREATE TABLE protocol_arms (
+  protocol_id INTEGER NOT NULL REFERENCES protocols(id),
+  arm_key TEXT NOT NULL,                      -- 'gemini-flash/S2'
+  run_config_id INTEGER NOT NULL REFERENCES run_configs(id),
+  model TEXT NOT NULL, provider TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('primary','secondary')),
+  PRIMARY KEY (protocol_id, arm_key)
+);
+
 CREATE TABLE sweeps (
-    id INTEGER PRIMARY KEY,
-    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
-    name TEXT NOT NULL,
-    git_sha TEXT NOT NULL,
-    git_dirty INTEGER NOT NULL,
-    food_vision_version TEXT NOT NULL,
-    openai_sdk_version TEXT NOT NULL,
-    pillow_version TEXT NOT NULL,
-    prompt_text TEXT NOT NULL,        -- full snapshot, not only a hash
-    prompt_hash TEXT NOT NULL,
-    schema_version TEXT NOT NULL,
-    schema_hash TEXT NOT NULL,
-    settings_snapshot TEXT NOT NULL,  -- JSON, secrets stripped (no API keys)
-    created_at TEXT NOT NULL
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('exploratory','protocol','probe')),
+  protocol_id INTEGER REFERENCES protocols(id),
+  split TEXT NOT NULL CHECK (split IN ('dev','test','adhoc')),
+  budget_usd REAL NOT NULL,
+  git_sha TEXT NOT NULL, git_dirty INTEGER NOT NULL,
+  package_versions TEXT NOT NULL,             -- JSON: food_vision, openai, pillow, numpy, python
+  settings_snapshot TEXT NOT NULL,            -- JSON, secrets removed
+  status TEXT NOT NULL CHECK (status IN ('created','running','paused','completed','failed')),
+  created_at TEXT NOT NULL, finished_at TEXT,
+  CHECK (kind <> 'protocol' OR protocol_id IS NOT NULL),
+  CHECK (split <> 'test' OR kind = 'protocol'),
+  CHECK (kind <> 'protocol' OR git_dirty = 0)
+);
+CREATE UNIQUE INDEX one_test_sweep_per_protocol
+  ON sweeps(protocol_id) WHERE split = 'test';
+
+CREATE TABLE tasks (
+  id INTEGER PRIMARY KEY,
+  sweep_id INTEGER NOT NULL REFERENCES sweeps(id),
+  run_config_id INTEGER NOT NULL REFERENCES run_configs(id),
+  model TEXT NOT NULL, provider TEXT NOT NULL,
+  primary_image_id INTEGER NOT NULL REFERENCES images(id),
+  UNIQUE (sweep_id, run_config_id, model, provider, primary_image_id)
 );
 
-CREATE TABLE run_batches (
-    id INTEGER PRIMARY KEY,
-    sweep_id INTEGER REFERENCES sweeps(id),       -- NULL only for pre-sweep ad-hoc exploration
-    experiment_id INTEGER REFERENCES experiments(id),
-    -- Fix (external review "data model" finding #2, multi-view support):
-    -- a batch no longer points at exactly one sample. `primary_sample_id`
-    -- is the specimen whose ground truth this batch is scored against;
-    -- `batch_images` (below) lists every image actually attached to the
-    -- request, so a `views='c1_c2'` batch has two rows there (both
-    -- conditions of the same specimen) while a single-view batch has one.
-    primary_sample_id INTEGER NOT NULL REFERENCES samples(id),
-    strategy TEXT NOT NULL CHECK (strategy IN ('S1','S2','S3','B0','B1')),
-    model TEXT,                     -- NULL for B0/B1 (no provider call)
-    routing_policy TEXT,             -- JSON: {order, allow_fallbacks, quantizations?, zdr, data_collection}
-    -- Generation knobs with a known/suspected confound effect get their
-    -- own column (filterable, chartable); everything else lives in
-    -- generation_config (JSON) to keep the schema stable as more knobs
-    -- get added, same discipline as routing_policy above.
-    temperature REAL,
-    seed INTEGER,
-    top_p REAL,
-    max_tokens INTEGER,
-    reasoning_effort TEXT CHECK (
-        reasoning_effort IN ('none','minimal','low','medium','high') OR reasoning_effort IS NULL
-    ),
-    structured_output_mode TEXT CHECK (
-        structured_output_mode IN ('json_schema','tool_call','json_object')
-    ),
-    generation_config TEXT,          -- JSON: reasoning_max_tokens, reasoning_exclude, etc.
-    resolution_px INTEGER,
-    image_format TEXT CHECK (image_format IN ('JPEG','WEBP','PNG')),
-    image_detail TEXT CHECK (image_detail IN ('low','high','auto') OR image_detail IS NULL),
-    views TEXT NOT NULL DEFAULT 'c1' CHECK (views IN ('c1','c2','c1_c2')),
-    image_config TEXT,               -- JSON: jpeg_quality, etc.
-    prompt_id TEXT,
-    prompt_version INTEGER,
-    prompt_hash TEXT,
-    prompt_config TEXT,              -- JSON: system_vs_user, persona_enabled,
-                                      --       reference_card_stated, prompt_language,
-                                      --       field_order, confidence_field_enabled
-    schema_version TEXT,
-    repeats INTEGER NOT NULL,        -- UI label: "epochs" (Inspect AI's term, per review)
-    calculator_fit_experiment_id INTEGER REFERENCES experiments(id),
-    prior_experiment_id INTEGER REFERENCES experiments(id),  -- S3 prior_source pointer
-    is_frozen_run INTEGER NOT NULL DEFAULT 0,
-    protocol_compliant INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN
-        ('queued','running','completed','failed','interrupted')),
-    created_at TEXT NOT NULL,
-    completed_at TEXT
+CREATE TABLE task_images (
+  task_id INTEGER NOT NULL REFERENCES tasks(id),
+  position INTEGER NOT NULL,
+  image_id INTEGER NOT NULL REFERENCES images(id),
+  PRIMARY KEY (task_id, position)
 );
 
-CREATE TABLE batch_images (
-    batch_id INTEGER NOT NULL REFERENCES run_batches(id),
-    sample_id INTEGER NOT NULL REFERENCES samples(id),
-    role TEXT NOT NULL CHECK (role IN ('primary', 'secondary')),
-    PRIMARY KEY (batch_id, sample_id)
+CREATE TABLE attempts (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id),
+  repeat_index INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN
+    ('queued','claimed','ok','invalid','refused','truncated','error','skipped_budget')),
+  claimed_at TEXT, heartbeat_at TEXT,         -- lease for resume (§7.2)
+  -- request
+  request_sha256 TEXT,                        -- canonical request, images replaced by their hashes
+  images_sent_sha256 TEXT,                    -- JSON array, bytes actually sent
+  -- response (what was returned)
+  model_resolved TEXT, provider_served TEXT, system_fingerprint TEXT,
+  generation_id TEXT, finish_reason TEXT, native_finish_reason TEXT,
+  raw_response TEXT,                           -- full JSON body
+  reasoning_text TEXT,
+  parsed TEXT,                                 -- JSON or NULL
+  schema_valid INTEGER,                        -- first try; no repair in protocol arms
+  parse_error TEXT,
+  -- prediction
+  edible_g_pred REAL,                          -- S1/S3 direct, S2 via fit
+  length_cm_pred REAL, max_diameter_cm_pred REAL,
+  -- telemetry
+  prompt_tokens INTEGER, completion_tokens INTEGER,
+  reasoning_tokens INTEGER, cached_tokens INTEGER,
+  cost_usd REAL, cost_is_estimate INTEGER,
+  latency_ms REAL, client_retries INTEGER,
+  started_at TEXT, ended_at TEXT,
+  error TEXT,
+  UNIQUE (task_id, repeat_index)
+);
+CREATE INDEX attempts_status ON attempts(status);
+
+CREATE TABLE reviews (
+  attempt_id INTEGER PRIMARY KEY REFERENCES attempts(id),
+  verdict TEXT NOT NULL CHECK (verdict IN ('plausible','wrong_object','ignored_card','implausible','other')),
+  notes TEXT, reviewed_at TEXT NOT NULL
 );
 
-CREATE TABLE run_attempts (
-    id INTEGER PRIMARY KEY,
-    batch_id INTEGER NOT NULL REFERENCES run_batches(id),
-    repeat_index INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('queued','ok','schema_invalid','error','refused')),
-    raw_response TEXT,               -- full JSON, not just parsed fields — re-parse without re-paying
-    edible_g_pred REAL,
-    kcal_pred REAL,
-    length_cm_pred REAL, max_diameter_cm_pred REAL,   -- S2 only
-    confidence_pred REAL,             -- when confidence_field_enabled
-    schema_valid INTEGER,
-    schema_valid_first_try INTEGER,   -- distinct from schema_valid: did it need a repair pass?
-    repair_attempted INTEGER,
-    parse_error TEXT,
-    refusal INTEGER,
-    -- Reproducibility fields (external review "reproducibility" finding:
-    -- "stores what you asked for, not what you got"). Requires the
-    -- proxy-layer CompletionResult extension noted in §6.
-    model_requested TEXT,
-    model_resolved TEXT,              -- aliases move; group/re-baseline by this + system_fingerprint
-    system_fingerprint TEXT,
-    provider_served TEXT,
-    openrouter_generation_id TEXT,     -- lets native token counts/upstream ID be fetched later
-    finish_reason TEXT,
-    native_finish_reason TEXT,         -- detects truncation/refusals/content filters the normalized field hides
-    prompt_tokens INTEGER, completion_tokens INTEGER,
-    reasoning_tokens INTEGER, cached_tokens INTEGER,
-    cost_usd REAL, cost_is_estimate INTEGER,
-    latency_ms REAL,
-    started_at TEXT, ended_at TEXT,     -- UTC ISO-8601 — correlates drift with provider-side deployments
-    attempts INTEGER,                   -- OpenRouterClient's own retry count
-    request_sha256 TEXT,                -- canonical request minus image bytes — exact replay
-    image_sent_sha256 TEXT,             -- proves which bytes were actually evaluated
-    seed_sent INTEGER,
-    seed_honoured INTEGER,              -- nullable: NULL when the provider gives no way to tell
-    reasoning_text TEXT,                 -- optional, kept separate from raw_response for readability
-    human_reviewed INTEGER NOT NULL DEFAULT 0,  -- ISERN guideline: validate a subset by hand
-    human_review_notes TEXT,
-    error TEXT,
-    created_at TEXT NOT NULL
+CREATE TABLE analysis_runs (
+  id INTEGER PRIMARY KEY,
+  protocol_id INTEGER REFERENCES protocols(id),
+  sweep_ids TEXT NOT NULL,                     -- JSON array
+  scope TEXT NOT NULL CHECK (scope IN ('protocol_test','exploratory_dev')),
+  n_boot INTEGER NOT NULL, bootstrap_seed INTEGER NOT NULL,
+  results TEXT NOT NULL,                       -- JSON, §6
+  git_sha TEXT NOT NULL, created_at TEXT NOT NULL
 );
 
 CREATE TABLE chart_exports (
-    id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,              -- e.g. 'predicted_vs_true', 'bland_altman', 'mape_by_model'
-    filter_spec TEXT NOT NULL,       -- JSON: sweep, experiment, split, strategy, models, exploratory-toggle, etc.
-    attempt_ids TEXT NOT NULL,       -- JSON array of run_attempts.id used, frozen at export time
-    bootstrap_seed INTEGER,
-    svg_path TEXT NOT NULL, png_path TEXT NOT NULL,
-    svg_sha256 TEXT NOT NULL, png_sha256 TEXT NOT NULL,
-    created_at TEXT NOT NULL
+  id INTEGER PRIMARY KEY,
+  analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id),
+  kind TEXT NOT NULL,
+  svg_path TEXT NOT NULL, png_path TEXT NOT NULL,
+  svg_sha256 TEXT NOT NULL, png_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 ```
 
-### 7.3 Per-sweep environment snapshot (`bench/sweeps.py`)
+Charts are derived from an `analysis_run`, never directly from a filter,
+so a figure, its numbers and its inputs always share one provenance chain.
 
-`create_sweep(db, experiment_id, name, prompt_path, schema_version) -> int`
-reads `importlib.metadata.version("food_vision")`,
-`importlib.metadata.version("openai")`,
-`importlib.metadata.version("pillow")`, runs `git rev-parse HEAD` +
-`git status --porcelain` (dirty flag) against the repo root, reads the
-full prompt text at `prompt_path` (and hashes it), computes a schema hash
-from `observation/schema.py`'s current output for that strategy, and
-serializes `get_settings()` with every field whose name contains `KEY`,
-`SECRET`, or `TOKEN` stripped — all inserted as one `sweeps` row before
-any batch under it is created. A sweep is immutable once created (no
-update path); starting a new sweep is the only way to change prompt/code/
-settings mid-study, which is the point — it's what makes "group results
-by fingerprint and re-baseline when it changes" (external review) and
-ISERN's "exact model version and run date, full config" both just a
-`sweeps` row lookup instead of archaeology.
+### 5.3 `run_config` canonical JSON
 
-### 7.4 `protocol_compliant`
+```json
+{
+  "strategy": "S2",
+  "prompt_sha256": "…", "output_schema_sha256": "…",
+  "fit_sha256": "…",
+  "generation": {"temperature": 0, "top_p": null, "seed": 20261009, "max_tokens": 2048,
+                 "reasoning": {"mode": "default"}, "structured_output_mode": "json_schema",
+                 "repair": false},
+  "image": {"long_edge_px": 1024, "format": "JPEG", "quality": 90, "detail": null,
+            "views": ["primary"]},
+  "routing": {"zdr": true, "data_collection": "deny", "quantizations": null},
+  "repeats": 3
+}
+```
 
-A batch is `protocol_compliant = 1` iff:
+`reasoning.mode` ∈ `default | off | effort` (with `effort` ∈
+`minimal|low|medium|high|xhigh|max`) `| budget` (with `max_tokens`).
+`views` is `["primary"]` or `["c1","c2"]` (the task's primary image plus
+the same specimen's other condition). Model and provider are deliberately
+outside the config so one config can be crossed with every candidate.
+
+### 5.4 Configuration files (TOML, stdlib `tomllib`)
+
+- `bench/configs/*.toml`: named exploratory configs (dev only).
+- `bench/protocols/prestudy-v1.toml`: the pre-registration. It lists the
+  dataset hash, arms (model × provider × config), the secondary arms, the
+  primary condition set, the metric definitions version, the decision rule
+  parameters (§6.3) and documented exceptions (e.g. a model without ZDR).
+  `prestudy protocol freeze` resolves every referenced prompt, schema and
+  fit to hashes, refuses on a dirty worktree, stores `toml_text` + sha256 +
+  `git_sha`, and writes the resolved arms to `protocol_arms`.
+
+## 6. Analysis
+
+### 6.1 Units and aggregation
+
+- **Analysis unit: specimen.** Images and repeats are nested within
+  specimens and are never treated as independent.
+- Per image and arm: prediction = **median** of valid repeats.
+- Per specimen and arm (primary metric): mean of the c1 and c2 image
+  predictions (card present). c3 is analysed separately (RQ4).
+- **Missing data, intention-to-score:** an image with no valid repeat gets
+  the B0 prediction for its type. This penalises unreliable models instead
+  of silently dropping their hard cases. A per-protocol variant (exclusions
+  instead) is reported alongside.
+- `edible_g` is the target; kcal is reported as a derived column only
+  (it equals grams × constant per type).
+
+### 6.2 Metrics
+
+| Metric | Definition | Role |
+|---|---|---|
+| MAPE | mean over specimens of \|pred − true\| / true | primary |
+| MedAPE | median of the same | secondary (robust) |
+| Relative gain vs B0 | 1 − MAPE(arm) / MAPE(B0), paired | gate |
+| **Size slope β** | OLS of log(pred) on log(true) with fruit-type fixed effects, image level, c1+c2 | gate (RQ2); β ≈ 0 means prior-only |
+| Geometric bias | exp(mean log(pred/true)) − 1 | gate |
+| Validity | share of attempts with `schema_valid = 1` and status `ok` | gate |
+| Repeatability | median within-image CV over repeats; ICC(2,1) absolute agreement (images × repeats) | gate (CV), descriptive (ICC) |
+| Bland–Altman | on log scale: mean log-ratio, 95% limits of agreement, back-transformed to % | descriptive, figure |
+| Lin's CCC, R² | on edible grams, specimen level | descriptive |
+| Reference gain | paired MAPE(c3) − MAPE(c2) | RQ4 |
+| S2 vs S1, S3 vs S1 | paired ΔMAPE, Δβ | RQ3, RQ5 |
+| B1 | MAPE of calculator on true dims | ceiling for S2 |
+| Cost / 1,000 images, latency P50/P95 | provider-reported cost; wall-clock per attempt | tie-breakers |
+| Reasoning share | reasoning_tokens / completion_tokens | RQ6 |
+
+Within-type Spearman ρ is reported per type as descriptive only (n = 5).
+
+**Uncertainty.** Every interval is a 95% percentile interval from a
+**specimen-cluster bootstrap**, stratified by fruit type, `n_boot` = 10,000,
+fixed seed recorded in `analysis_runs`. Paired comparisons resample
+specimens once and compute both arms on the same resample.
+
+### 6.3 Decision rule (parameters fixed in the protocol file)
+
+Eligibility gates, evaluated on the **test** split, primary arms, c1+c2:
+
+- validity ≥ 98%
+- β point estimate in [0.7, 1.3] **and** β CI lower bound > 0.3
+- geometric bias within ±10%
+- relative gain vs B0 ≥ 30% **and** its CI lower bound > 0
+- median within-image CV ≤ 5%
+
+Selection:
+
+- Per model, its strategy is S1 unless S2 (or S3) has a paired ΔMAPE CI
+  entirely below 0, in which case the better one is used. Simpler wins ties.
+- Rank eligible (model, strategy) arms by MAPE. Any arm whose paired ΔMAPE
+  vs the best has a CI containing 0 is **tied**. Among tied arms, choose
+  lowest cost per 1,000 images, then lowest P95 latency.
+- Fallback: the best eligible arm from a **different vendor**.
+- **Stop rule:** if no arm passes the gates, the decision is "stop"; Phase 0
+  does not start on photo estimation as designed.
+
+Only RQ1's selection is confirmatory. RQ2–RQ6 are reported with intervals
+but no significance claims; with ~20 comparisons, a few "significant"
+differences are expected by chance.
+
+## 7. Components
+
+### 7.1 Package layout
 
 ```text
-temperature == 0
-AND resolution_px IN (1024, 768)
-AND repeats == 3
-AND (primary_sample.split != 'test' OR (strategy IN ('B0','B1')) OR
-     EXISTS frozen_prompts WHERE strategy = batch.strategy
-                             AND prompt_hash = batch.prompt_hash)
+src/food_vision/
+├── cli.py                              # typer root; `food-vision prestudy …`
+├── imaging/
+│   ├── preprocess.py                   # decode (+HEIC), exif_transpose, pixel guard, resize, strip, encode
+│   └── covariates.py                   # EXIF make/model/focal read BEFORE stripping
+├── observation/
+│   ├── schema.py                       # output schemas S1/S3, S2; registered in output_schemas
+│   ├── prompts/                        # fruit_s1_v1_en.md, fruit_s2_v1_en.md, fruit_s3_v1_en.md
+│   └── adapter.py                      # observe(): messages, mode, parse, classify outcome
+├── domain/
+│   └── calculator.py                   # pure S2 formulas; kcal_from_edible_g
+└── prestudy/
+    ├── db.py                           # connect() ctx manager, migrations, queries
+    ├── dataset.py                      # import specimens/images/sessions CSVs
+    ├── fits.py                         # calculator, prior, B0 from dev; hashing
+    ├── configs.py                      # TOML → canonical run_config; hashing; capability table
+    ├── protocols.py                    # freeze, validate, arms
+    ├── sweeps.py                       # create (env snapshot), expand to tasks, estimate
+    ├── executor.py                     # leased worker pool, budget, resume, drain
+    ├── analysis.py                     # §6 metrics, bootstrap, decision rule → analysis_runs
+    ├── charts.py                       # matplotlib Agg, SVG + 600-dpi PNG from analysis_runs
+    ├── report.py                       # results.json, tables.md, decision.md
+    └── web/
+        ├── app.py                      # create_app(); routes; Depends(get_db)
+        ├── templates/                  # probe, sweeps, sweep_detail, attempts, attempt, analysis
+        └── static/prestudy.css
+
+bench/
+├── sets/fruit-v1/{specimens.csv,images.csv,sessions.csv,README.md}   # images untracked
+├── configs/*.toml                      # exploratory configs
+├── protocols/prestudy-v1.toml          # pre-registration
+└── reports/prestudy-v1/                # results.json, tables.md, decision.md, charts/
+data/fruit_reference.csv                # bls_code, fruit_type, kcal_100g, waste/density priors
+var/prestudy/                           # gitignored: prestudy.db, raw/, sent/
 ```
 
-Computed once at batch creation in `runs.py`, stored (not recomputed ad
-hoc). `metrics.py`'s decision-rule aggregations (MAPE/Spearman ρ/slope/
-bias/Bland–Altman/ICC/median APE/R²/CCC — concept §Appendix A.6 plus §9's
-additions) filter to `protocol_compliant = 1` **by default**;
-`history.html` and `charts.html` both expose an explicit "include
-exploratory runs" toggle, and every chart export's `filter_spec` records
-whether that toggle was on.
+The package is named `prestudy`, not `bench`, so it can't be confused with
+the top-level `bench/` data directory.
 
-Unchanged from the prior revision otherwise: the frozen-test-split
-guard (`is_frozen_run`) and per-(model, strategy) test-split counter in
-`history.html` apply exactly as before.
+### 7.2 Executor (`prestudy/executor.py`)
 
-## 8. Component responsibilities
+- **Claiming.** Workers claim one queued attempt at a time with
+  `UPDATE attempts SET status='claimed', claimed_at=?, heartbeat_at=?
+  WHERE id = (SELECT id FROM attempts WHERE status='queued' AND task_id IN
+  (…sweep…) LIMIT 1) RETURNING id`. Each worker uses its own connection.
+- **Concurrency.** `ThreadPoolExecutor(max_workers=4)` by default, plus a
+  per-provider semaphore (default 2) to stay under rate limits. 429/5xx
+  retries remain the proxy's responsibility.
+- **Lease and resume.** Workers heartbeat every 15 s. `prestudy sweep
+  resume` (and every `run` start) returns `claimed` attempts with a
+  heartbeat older than 120 s to `queued`. A crash, Ctrl-C or reboot loses
+  at most the in-flight calls.
+- **Budget.** Before claiming, the worker checks
+  `spent + reserved + estimate_per_attempt ≤ budget_usd`. If exceeded, the
+  sweep is set `paused`, and the remaining attempts stay `queued` (resumable
+  with a raised budget). Estimates come from `prestudy sweep estimate`,
+  which runs one real attempt per (config, model) on a dev image and
+  extrapolates.
+- **Graceful drain.** SIGINT stops claiming, waits for in-flight calls,
+  writes their results, sets the sweep to `paused`.
+- **Outcome classification** (from `adapter.observe`):
+  `ok` · `invalid` (schema/parse failure) · `refused` (refusal text or
+  content-filter `native_finish_reason`) · `truncated` (`finish_reason =
+  length`; empty content with reasoning tokens means the reasoning budget
+  was exhausted) · `error` (transport after retries). Only `ok` produces a
+  prediction; validity counts `invalid` + `refused` + `truncated` as
+  failures, `error` is retried by resume and excluded once permanent.
 
-### 8.0 `imaging/covariates.py` (new)
+### 7.3 Observation adapter (`observation/adapter.py`)
 
-`extract_covariates(raw_image_bytes) -> SampleCovariates` — reads EXIF via
-Pillow (`Image.getexif()`) **before** `preprocess.normalize_image` strips
-it: camera make/model, focal length (35mm-equivalent where available).
-Capture distance/lighting/background/scale-model/scale-resolution are not
-in EXIF — they're entered once per capture session alongside the
-manifest (`fruit-v1`) or via a small form field for manual uploads, and
-`bench/dataset.py`/the upload route write them onto the `samples` row.
-Pure function on image bytes; no network, no DB — easy to unit test
-against a handful of fixture images with known EXIF.
+`observe(provider, *, images: list[bytes], config: RunConfig, model, routing)
+-> Observation`
 
-### 8.1 `imaging/preprocess.py`
+- Builds one user message: prompt text, then image parts as base64 data
+  URLs in `views` order.
+- `structured_output_mode`: `json_schema` → `response_format` strict;
+  `json_object` → schema text appended to the prompt, validated after.
+  Supported modes per model come from `configs.CAPABILITIES`, filled by
+  `prestudy smoke` and committed. A config requesting an unsupported mode
+  for a model is rejected at sweep creation, not at call time.
+- `repair` is `false` in protocol arms; exploratory configs may enable one
+  repair round, recorded in the config.
+- Prompts never contain numeric anchors except S3's stated prior. All
+  prompts define "edible portion" per type (banana/orange/mandarin/kiwi:
+  without peel; apple/pear: without core and stem).
 
-Unchanged contract: `normalize_image(path_or_bytes, max_px, *, image_format='JPEG', jpeg_quality=90) -> bytes`
-— Pillow decode (enforcing `PRESTUDY_MAX_DECODED_PIXELS` before full
-decode), resize longest edge to `max_px`, strip EXIF, re-encode. `format`/
-`jpeg_quality` are now parameters (external review: independent variables
-to make configurable), not hardcoded — called once per image per batch's
-`image_format`/`jpeg_quality`/`resolution_px`.
+### 7.4 Proxy extension (`proxy/openrouter.py`), required before §7.2
 
-### 8.2 `observation/{schema.py,adapter.py,prompts/}`
+`complete()` gains `top_p`, `max_tokens`, `reasoning: dict | None`
+(passed as OpenRouter `reasoning`), and `response_format` for both modes.
+`CompletionResult` gains:
 
-Expanded surface vs. the prior revision:
+| Field | Source |
+|---|---|
+| `generation_id` | `response.id` |
+| `model_resolved` | `response.model` |
+| `system_fingerprint` | `response.system_fingerprint` (often null) |
+| `native_finish_reason` | `choices[0].native_finish_reason` |
+| `reasoning_text` | `choices[0].message.reasoning` |
+| `reasoning_tokens` | `usage.completion_tokens_details.reasoning_tokens` |
+| `cached_tokens` | `usage.prompt_tokens_details.cached_tokens` |
+| `raw` | full response as dict |
+
+`prestudy sweep enrich <id>` optionally back-fills provider-side latency
+and native token counts from OpenRouter's generation stats by
+`generation_id`. Seed honouring is not stored per attempt; it is tested
+once per model in `prestudy smoke` (two seeds, five calls each, compare
+dispersion) and recorded in the capability table.
+
+### 7.5 Imaging
+
+- `preprocess.normalize(raw: bytes, cfg: ImageConfig) -> bytes`: refuse
+  above `PRESTUDY_MAX_DECODED_PIXELS` before full decode, `ImageOps.exif_transpose`
+  (otherwise portrait phone photos are sent sideways), resize long edge,
+  drop all metadata, encode. Deterministic: same input + config → same bytes
+  (tested by hash).
+- `covariates.extract(raw: bytes) -> ExifCovariates`: make, model, focal
+  length, 35 mm equivalent, dimensions. Stored in `images`, never sent.
+- Bytes actually sent are written to `var/prestudy/sent/<sha256>.jpg` once,
+  so any attempt can be replayed exactly.
+
+### 7.6 Web UI (`prestudy/web/`)
+
+Served by `food-vision prestudy serve` on `127.0.0.1:8800`. Pages:
+
+| Page | Purpose |
+|---|---|
+| Probe | Pick a dev image or upload one (stored as `source='upload'`), pick ≤3 models and one named exploratory config, run. Creates a `probe` sweep with ≤9 attempts, executed in-process with the same executor (1 worker). Shows results side by side with the image. |
+| Sweeps | List with kind, split, progress, cost vs budget, status. Read-only. |
+| Sweep detail | Per-arm progress and outcome counts, cost so far, failures. |
+| Attempts | Filterable table (sweep, model, strategy, status, fruit type, condition). |
+| Attempt | Sent image, prompt, raw response, reasoning text, parsed output, prediction vs truth, review form. |
+| Analysis | Renders a stored `analysis_run` (tables + charts). Can trigger an `exploratory_dev` analysis; protocol analysis is CLI-only. |
+
+Hard rule: no route accepts or returns a test-split image, specimen or
+attempt except Analysis pages rendering a completed `protocol_test` run.
+
+### 7.7 CLI (`food-vision prestudy …`)
+
+```text
+import-dataset bench/sets/fruit-v1/
+fit --dataset fruit-v1                               # calculator, prior, B0 from dev
+smoke --models bench/configs/candidates.toml         # capability + seed probe, writes CAPABILITIES
+sweep create --config bench/configs/dev-explore.toml --split dev --budget 5
+sweep estimate <id> | run <id> [--workers 4] | resume <id> [--budget 20] | enrich <id>
+protocol freeze bench/protocols/prestudy-v1.toml
+sweep create --protocol prestudy-v1 --split test --budget 60 --confirm-test
+analyze --protocol prestudy-v1 --out bench/reports/prestudy-v1/
+serve
+```
+
+`--confirm-test` prints the arm list, image count, attempt count and
+estimated cost, then requires typing the protocol name.
+
+### 7.8 Settings additions
 
 ```python
-def observe(
-    client: ModelProvider,
-    *,
-    image_bytes: list[bytes],          # 1 entry for single-view, 2 for views='c1_c2'
-    strategy: Strategy,
-    model: str,
-    routing_mode: RoutingMode,
-    routing_policy: RoutingPolicy,
-    temperature: float,
-    seed: int | None,
-    top_p: float | None,
-    max_tokens: int | None,
-    reasoning_effort: ReasoningEffort | None,
-    reasoning_config: ReasoningConfig | None,   # max_tokens budget, exclude
-    structured_output_mode: StructuredOutputMode,  # json_schema | tool_call | json_object
-    prompt_id: str,
-    prompt_version: int,
-    prompt_config: PromptConfig,        # system_vs_user, persona_enabled,
-                                         # reference_card_stated, language, field_order,
-                                         # confidence_field_enabled
-    schema_version: str,
-) -> ObservationResult: ...
+PRESTUDY_DB_PATH: Path = Path("var/prestudy/prestudy.db")
+PRESTUDY_DATA_DIR: Path = Path("var/prestudy")        # raw/, sent/
+PRESTUDY_MAX_UPLOAD_BYTES: int = 15 * 1024 * 1024
+PRESTUDY_MAX_DECODED_PIXELS: int = 40_000_000
+PRESTUDY_WORKERS: int = 4
+PRESTUDY_PER_PROVIDER_CONCURRENCY: int = 2
 ```
 
-- Prompt files are now named `{strategy}_v{version}_{language}.md`
-  (§4), loaded via `prompt_id`+`prompt_version`+`prompt_config.language`;
-  `prompt_config.field_order='observations_first'` picks a schema/prompt
-  variant that asks for a free-text `observations` field *before*
-  `edible_g` — in-schema chain-of-thought without spending reasoning
-  tokens (external review).
-- `structured_output_mode` selects how the schema is enforced: strict
-  `response_format: json_schema` (current default), an OpenRouter
-  `tools`/function-call shape, or a `json_object` mode where the schema is
-  described in the prompt text only and validated after the fact — not
-  every candidate model supports `json_schema`, and the mode itself can
-  change results, so it has to be a logged variable, not an assumption.
-  **`structured_output_mode` is itself a `run_batches` column** (§7.2),
-  filterable in `history.html`/charts.
-- `views='c1_c2'` attaches both condition images in one message — cheap
-  multi-view condition to test (external review cites Cal AI using this).
-  `observe()` takes `image_bytes: list[bytes]` for this reason even though
-  almost all batches pass a single-element list.
-- A reasoning-exhaustion failure mode is explicitly handled, not silently
-  mis-scored: OpenRouter reasoning tokens count against `max_tokens`; when
-  reasoning consumes the whole budget, the response comes back with
-  `finish_reason: length` and empty `content`. `adapter.observe` detects
-  this (`finish_reason == 'length' and not content`) and returns a
-  distinct `ObservationResult.error = "reasoning_budget_exhausted"` rather
-  than a generic schema-parse failure — this is a capacity/config problem,
-  not a model-capability one, and the two must not be conflated in
-  `schema_valid_rate`.
-- `routing_policy`/`temperature`/`seed`/everything else above is passed
-  through from the batch's stored params, never re-read from `Settings`
-  here — unchanged reasoning from the prior revision, just a longer
-  parameter list now.
+No directory creation at import or `Settings()` time; `db.connect()` and
+`serve` create what they need.
 
-### 8.3 `domain/calculator.py`
+### 7.9 Dependencies
 
-Unchanged: pure S2 formulas, property-tested, called with constants from
-`bench/calculator_fits.py` keyed by `experiment_id`.
+```toml
+"typer>=0.12", "fastapi>=0.115,<1", "uvicorn[standard]>=0.32,<1",
+"python-multipart>=0.0.12", "jinja2>=3.1,<4",
+"pillow>=11,<12", "pillow-heif>=0.18", "numpy>=2.0", "matplotlib>=3.9,<4",
+```
 
-### 8.4 `bench/fruit_reference.py` / `bench/calculator_fits.py` / `bench/prior_values.py`
+## 8. Test-split protection (summary of enforced rules)
 
-Unchanged from the prior revision.
+| Rule | Enforced by |
+|---|---|
+| Test images only in `protocol` sweeps | `sweeps` CHECK; `sweeps.create` |
+| Protocol sweeps only with clean worktree | `sweeps` CHECK on `git_dirty` |
+| Only frozen arms in a protocol sweep | task expansion reads `protocol_arms` only |
+| One test sweep per protocol | partial unique index; reruns via `resume` |
+| A new test sweep needs a new protocol with `supersedes_id` + reason | `protocols` CHECK; report lists all protocols |
+| Fits from dev only | `fits` CHECK |
+| Web UI never exposes test data before analysis | route filters; tested |
+| Exploratory analysis is dev-only | `analysis_runs.scope`; `analysis.run` |
 
-### 8.5 `bench/dataset.py`
+## 9. Testing
 
-Unchanged core contract (`import_manifest`), extended to also populate the
-new `samples` covariate columns (§7.2) from manifest fields (if the
-manifest schema is extended to carry them — see §11 open item) or from a
-companion per-specimen metadata file if not.
+No live network calls; fake `ModelProvider`; temp SQLite per test.
 
-### 8.6 `bench/sweeps.py` (new, see §7.3)
+| Area | Tests |
+|---|---|
+| `imaging` | determinism by hash; exif_transpose applied; metadata absent after; pixel-bomb rejected; HEIC fixture decodes |
+| `observation` | message shape per views; mode selection; outcome classification for ok / invalid / refused / truncated (length + reasoning tokens + empty content) |
+| `calculator`, `fits` | property tests (monotone in L and D, positive, unit sanity); fit rejects any test specimen |
+| `configs`, `protocols` | canonical JSON stable across key order; hash changes on any field change; freeze refuses dirty tree and unknown prompt/fit; unsupported mode rejected |
+| `sweeps` | expansion counts; idempotent re-create; test sweep without protocol rejected; second test sweep rejected |
+| `executor` | concurrent claim never double-claims (threads); stale lease requeued; budget pause and resume; SIGINT drain leaves no `claimed` rows |
+| `analysis` | MAPE/bias/β/ICC/CCC/Bland–Altman against fixtures computed offline with scipy/pingouin and committed as JSON; cluster bootstrap resamples specimens, not images; ITT imputation; decision rule on synthetic arms (eligible, tied, stop) |
+| `charts` | each kind writes valid SVG and PNG, registers one `chart_exports` row |
+| `web` | probe flow end-to-end with fake provider; every route returns 404 for test-split ids; upload size/type limits |
 
-`create_sweep(...) -> int` as described in §7.3. Called once per sweep
-from `new_sweep.html` (§8.9), not per batch.
+Coverage floor raised to 85% for `prestudy/`, `observation/`, `imaging/`,
+`domain/`.
 
-### 8.7 `bench/runs.py`
+## 10. Milestones
 
-- `create_batch(db, *, sweep_id, primary_sample_id, secondary_sample_id=None,
-  views, strategy, model, routing_policy, temperature, seed, top_p,
-  max_tokens, reasoning_effort, reasoning_config, structured_output_mode,
-  resolution_px, image_format, jpeg_quality, image_detail, prompt_id,
-  prompt_version, prompt_config, schema_version, repeats,
-  experiment_id, calculator_fit_experiment_id=None, prior_experiment_id=None,
-  is_frozen_run=False) -> int`:
-  - All validation from the prior revision still applies (model
-    allowlist, `routing_policy.provider_pin` required for S1–S3 and
-    `quantizations` optional, B0/B1 ignore routing/generation params, S2/
-    B1 require a resolvable `calculator_fits` row, S3 requires a
-    resolvable `prior_values` row, frozen-test-split guard, `prompt_hash`
-    resolved from the sweep's frozen prompt text + `prompt_config`).
-  - `views='c1_c2'` requires `secondary_sample_id` to be a sample with the
-    same `specimen_id` and the complementary condition (`c2` when primary
-    is `c1`); inserts two `batch_images` rows.
-  - `structured_output_mode` defaults to `'json_schema'` but is validated
-    against a small per-model capability table (not every model supports
-    strict JSON Schema) rather than assumed universal.
-  - Computes `protocol_compliant` per §7.4, inserts the batch + N queued
-    `run_attempts` rows in one transaction, returns `batch_id`.
-- `execute_batch(db_path, client, batch_id)` — unchanged connection
-  discipline (§7.1: own connection, never the request's). For each repeat:
-  resolves image(s) via `batch_images`, builds the request via
-  `observation.adapter.observe` with the full parameter set above, and
-  writes every reproducibility field in §7.2's `run_attempts` columns from
-  the (proxy-layer-extended, §6) `CompletionResult`: `model_resolved`,
-  `system_fingerprint`, `openrouter_generation_id`, `native_finish_reason`,
-  `reasoning_tokens`, `cached_tokens`, `request_sha256`/
-  `image_sent_sha256` (computed here, not by the proxy — the proxy
-  shouldn't need to know about canonicalization rules), `started_at`/
-  `ended_at` (UTC, bracketing the call). A `reasoning_budget_exhausted`
-  result is written with `status='error'`, `parse_error` set to that
-  string, and is excluded from `schema_valid_rate` denominators (it's not
-  a parse attempt at all).
-- Startup `interrupted`-marking: unchanged from the prior revision.
+| M | Content | Exit | Status |
+|---|---|---|---|
+| M1 | proxy extension (§7.4), imaging, observation, calculator | `observe()` returns a classified Observation from a recorded fixture | **done** |
+| M2 | db, dataset, fits, configs, sweeps, executor, CLI | dev sweep of 1 model × S1 runs, is killed, resumes, completes within budget | not started |
+| M3 | capture `fruit-v1` (can run in parallel from day 1) | 144 images, CSVs validated by `import-dataset` | not started |
+| M4 | smoke, dev exploration, prompt iteration, fits | capability table committed; prompts at v-final | not started |
+| M5 | analysis, charts, report; web UI | `analyze` reproduces fixtures; probe + attempt review usable | not started |
+| M6 | protocol freeze → test sweep → analyze → decision | `bench/reports/prestudy-v1/decision.md` | not started |
 
-### 8.8 `bench/metrics.py`
+### M1 — done when / test / left over
 
-Existing functions (`mape`, `spearman_rho_and_slope`, `signed_bias`,
-`repeat_cv`, `schema_valid_rate`, `bootstrap_ci`) plus, per the external
-review's "metrics to add":
+| Step | DONE WHEN | TEST | LEFT OVER |
+|---|---|---|---|
+| Proxy extension (§7.4) | `complete()` accepts `top_p`/`max_tokens`/`reasoning`; `response_format` accepts `JsonObjectFormat`; `CompletionResult` carries `generation_id`, `model_resolved`, `system_fingerprint`, `native_finish_reason`, `reasoning_text`, `reasoning_tokens`, `cached_tokens`, `raw` | `tests/unit/test_openrouter.py` (25 tests: new fields present when returned, default to `None`/`{}` when absent, `top_p`/`max_tokens`/`reasoning` only sent when given, `JsonObjectFormat` payload shape) | Seed-honouring verification (per model, via `prestudy smoke`) is M4, not implemented. Provider-side latency/native-token back-fill by `generation_id` (`prestudy sweep enrich`) is M2+. |
+| `domain/calculator.py` | `banana_volume_g`, `ellipsoid_mass_g`, `kcal_from_edible_g` are pure, positive, monotone in length/diameter, reject non-finite/negative/out-of-range inputs | `tests/unit/test_calculator.py` (28 tests: positivity, monotonicity, linear scaling, sphere-degeneracy cross-check, invalid-input rejection) | No fitted constants ship in this module by design — `shape_constant`/`density_g_cm3`/`edible_ratio` are required caller-supplied arguments. M2's `prestudy fit` produces and hashes the real dev-fitted values; nothing here needs to change when it lands, only callers gain a source for the numbers. |
+| `imaging/preprocess.py` | `normalize(raw, cfg)` is deterministic (same bytes in → same bytes out), applies `exif_transpose`, resizes to `long_edge_px`, strips all metadata, rejects images over `max_decoded_pixels` before full decode, decodes HEIC | `tests/unit/test_preprocess.py` (6 tests, incl. a real in-memory HEIC fixture via `pillow-heif`) | `PRESTUDY_MAX_DECODED_PIXELS` is not yet a `Settings` field — callers pass `ImageConfig.max_decoded_pixels` explicitly. Wiring it into `Settings` is M2 (alongside the other `PRESTUDY_*` additions in §7.8), once there's a CLI/executor to read it from. |
+| `imaging/covariates.py` | `extract(raw)` reads make/model/focal length/35mm-equivalent/dimensions without mutating or being affected by `normalize()` | `tests/unit/test_covariates.py` (5 tests, incl. missing-EXIF and EXIF-IFD-without-focal-length cases) | Nothing stores `ExifCovariates` yet — the `images` table it's destined for (§5.2) is M2. |
+| `observation/schema.py` | Per-strategy strict schemas (S1/S3: `observations`+`edible_g`; S2: `observations`+`length_cm`+`max_diameter_cm`), `observations` always first, no confidence field, `validate_observation()` rejects missing/extra/wrong-typed/non-finite/negative fields | `tests/unit/test_schema.py` (18 tests) | Schema registration in the `output_schemas` table (§5.2, content-hashed) is M2. |
+| `observation/prompts/*.md` | One markdown file per strategy, loaded as package data via `importlib.resources`, no numeric anchors except S3's `{prior_low_g}`/`{prior_high_g}` placeholders | Covered indirectly by `test_observation_adapter.py`'s prompt-rendering tests (S3 placeholder substitution) | Prompts are v1, not v-final — M4's dev exploration and prompt iteration may change the wording; the filename convention (`_v1_`) already reserves room for `_v2_` etc. without breaking `_PROMPT_FILENAMES`. |
+| `observation/adapter.py` | `observe()` builds one user message (prompt + images in view order), selects `json_schema` vs `json_object` mode, classifies the outcome as `ok`/`invalid`/`refused`/`truncated` (incl. the reasoning-budget-exhaustion case), rejects `repair=True` and view/image-count mismatches | `tests/unit/test_observation_adapter.py` (14 tests, fake `ModelProvider`, no network) | §7.3's real signature takes M2's `configs.RunConfig`; this module defines a local `ObservationConfig` substitute instead (documented in the module docstring) — message-building/classification logic is expected to carry over unchanged, only the config source changes. Per-model `structured_output_mode` capability resolution (the `CAPABILITIES` table) is M2/M4, not enforced here — the caller picks the mode. The `error` outcome (transport failure) isn't produced here; it surfaces as `OpenRouterError` for the M2 executor to classify. |
 
-- `bland_altman(predicted, true) -> BlandAltmanResult` — mean bias, SD of
-  differences, 95% limits of agreement (`bias ± 1.96·SD`).
-- `icc(repeated_predictions_by_group) -> float` — intraclass correlation
-  across repeats (two-way random, agreement form — the variant used in
-  the cited 2026 GPT-5.2/Gemini-3-Flash/Claude-Sonnet-4.6 weighed-meals
-  study), computed as a one-way ANOVA-based ICC(1) to stay inside plain
-  `statistics` rather than pulling in `pingouin`/`statsmodels`.
-- `median_ape(predicted, true) -> float` — more robust to outlier
-  specimens than mean MAPE; reported alongside it, not instead of it.
-- `r_squared(predicted, true) -> float`.
-- `lins_ccc(predicted, true) -> float` — Lin's concordance correlation
-  coefficient, combines precision (Pearson r) and accuracy (bias from the
-  45° line) into one number; complements Spearman ρ (rank-only) and the
-  Bland–Altman bias/LoA (additive-bias-focused).
+All of M1 lint/type/test-clean: `make ci` passes (ruff format/check, mypy
+--strict, pytest with the §9 85% coverage floor — actual ~98%).
 
-All of the above take an explicit `protocol_compliant_only: bool = True`
-filter argument, same discipline as the existing metrics.
+Estimated test-sweep size: 7 models × 3 strategies × 90 images × 3 repeats
+≈ 5,700 attempts, plus ~1,100 for secondary arms. The budget is set from
+`sweep estimate`, not guessed.
 
-### 8.9 `bench/charts.py`
+## 11. Risks
 
-Existing chart kinds unchanged, plus:
+| Risk | Mitigation |
+|---|---|
+| Candidate unavailable under ZDR + pinned provider | smoke test before freeze; documented exception or drop |
+| Provider silently changes model mid-sweep | `model_resolved` + `system_fingerprint` per attempt; analysis flags arms with >1 value |
+| Reasoning models ignore temperature/seed | temperature `null` allowed per arm; seed probe in smoke |
+| Test split burned by curiosity | §8 rules are constraints, not conventions |
+| Too few specimens for confident ranking | 30 test specimens; ties declared from paired CIs; cost decides ties |
+| Fit overfits 3 dev specimens per type | B1 reports formula error on test; S2 adopted only if it beats S1 on paired CI |
+| Cost overrun | per-sweep hard budget, estimate from real calls, pause not fail |
+| Results don't transfer to meals | concept A.8 sanity check on Nutrition5k before Phase 0 |
 
-- `bland_altman_plot` (difference vs. mean, bias line, LoA band, per
-  model/strategy) — a standard figure type in the domain literature cited
-  by the review (Cureus 2026, Nakagawa & Yamamoto 2026, ACETADA); directly
-  reusable in a paper.
-- `calibration_plot` — when `confidence_field_enabled`, predicted
-  confidence vs. empirical accuracy, binned; "nearly free" per the review
-  since `confidence_pred` is already a stored column.
-- `reasoning_effort_tradeoff` — cost/latency/MAPE vs. `reasoning_effort`,
-  the parameter the review flags as "mov[ing] cost, latency and probably
-  accuracy more than temperature does."
+## 12. Deviations from concept Appendix A
 
-Resolution-comparison charts keep the existing provider-side-tiling
-caveat (Gemini ~768px tiles, OpenAI ~512px tiles confound the 768-vs-1024
-comparison) — unchanged from the prior revision.
-
-### 8.10 `bench/web/app.py`
-
-New `new_sweep.html` form (git SHA/dirty flag and package versions are
-read automatically, not entered by hand; the researcher picks experiment,
-prompt file + version, schema version, and names the sweep) feeding
-`bench/sweeps.py`, sitting in front of the existing `new_run.html` (which
-now also exposes the expanded parameter set: `top_p`, `max_tokens`,
-reasoning effort/budget/exclude, `structured_output_mode`, image
-format/quality/detail, `views`, prompt placement/persona/reference-card-
-stated/language/field-order/confidence-field toggles — grouped into
-collapsible sections in the template so the common path, S1/S2/S3 with
-mostly-default params, isn't buried). Connection handling (§7.1),
-frozen-run checkbox (§7.4), and history/chart routes are otherwise
-unchanged from the prior revision.
-
-## 9. Open-model baseline and contamination (external review)
-
-Per the ISERN LLM-study guidelines cited in the review (exact model
-version + run date, full config, exact prompts, **an open-model
-baseline**, **a contamination check**, human validation of a subset):
-
-- **Open-model baseline**: add an open-weights candidate to the model
-  list (the review names Qwen3-VL as the general candidate and Food-R1 —
-  a food-specialized Qwen3-VL-8B with published Nutrition5k numbers — as
-  a food-specific one). No code/schema change: it's just another `model`
-  value on OpenRouter (or a self-hosted endpoint behind the same
-  `ModelProvider` Protocol, if not available on OpenRouter) going through
-  the same batch/attempt pipeline. Tracked as an open item (§11) because
-  model-candidate selection is an operational decision made when the
-  sweep runs, consistent with how the rest of this doc treats the
-  candidate list.
-- **Contamination**: `fruit-v1`'s own photos sidestep training-set
-  contamination by construction (they're not a published benchmark like
-  Nutrition5k) — worth stating explicitly in the eventual report rather
-  than leaving it implicit.
-- **Human validation of a subset**: `run_attempts.human_reviewed`/
-  `human_review_notes` (§7.2) exist so a researcher can mark a sampled
-  subset of attempts as manually checked against the image — a workflow
-  note (check a stratified sample after each sweep), not a feature to
-  build; `history.html`'s filter can select `human_reviewed = 0` rows to
-  sample from.
-
-## 10. Testing plan
-
-All against a temp SQLite file per test (`tmp_path`), FastAPI
-`TestClient`, and a fake `ModelProvider` — **no live OpenRouter calls**.
-
-- `tests/unit/test_bench_db.py` — schema creation/versioning, insert/query
-  round-trips for every table including the new `sweeps`/`batch_images`,
-  WAL/foreign-key pragmas applied, cross-thread connection regression
-  test (unchanged from the prior revision).
-- `tests/unit/test_bench_sweeps.py` — `create_sweep` captures git SHA/
-  dirty flag/package versions correctly (mocked `subprocess`/
-  `importlib.metadata`), strips secret-like settings keys, is immutable
-  (no update path exists).
-- `tests/unit/test_imaging_covariates.py` — EXIF extraction against
-  fixture images with known/missing EXIF (missing EXIF yields `None`
-  fields, not an exception); confirms the function never touches the
-  network or DB.
-- `tests/unit/test_bench_dataset.py`, `test_bench_calculator_fits.py`,
-  `test_bench_prior_values.py` — unchanged from the prior revision.
-- `tests/unit/test_bench_runs.py` — all prior-revision cases, plus:
-  `views='c1_c2'` requires a matching-specimen secondary sample and
-  inserts two `batch_images` rows; `structured_output_mode` validated
-  against a per-model capability table; `execute_batch` writes every new
-  reproducibility column from a fake `CompletionResult` carrying
-  `model_resolved`/`system_fingerprint`/etc.; a `finish_reason: length`
-  with empty content is recorded as `reasoning_budget_exhausted` and
-  excluded from `schema_valid_rate`, not conflated with a generic parse
-  failure.
-- `tests/unit/test_bench_metrics.py` — existing cases plus: Bland–Altman
-  bias/LoA against a hand-computed fixture, ICC against a known-value
-  fixture (e.g. perfect agreement → ICC ≈ 1, independent noise → ICC ≈ 0),
-  median APE and R² on simple fixtures, Lin's CCC against a published
-  worked example.
-- `tests/unit/test_bench_charts.py` — existing cases plus `bland_altman_plot`/
-  `calibration_plot`/`reasoning_effort_tradeoff` produce valid SVG/PNG
-  output; no pixel comparison.
-- `tests/unit/test_prestudy_web.py` — existing cases plus `new_sweep.html`
-  round-trip (create sweep, then a batch referencing it); the expanded
-  `new_run.html` param form rejects an unsupported
-  `structured_output_mode` for the selected model (422).
-
-## 11. Open items deferred, not blocking
-
-- Retention/backup policy for `var/prestudy/`: unchanged — keep
-  everything, no auto-deletion.
-- `uv_build` package-data inclusion: unchanged — verify with a dry-run
-  once files exist.
-- Exact OpenRouter provider slugs/quantization labels per candidate: an
-  operational decision made when the sweep runs.
-- **Final candidate model list**, including whether/which open-weights
-  model (Qwen3-VL, Food-R1) is actually reachable (via OpenRouter or a
-  self-hosted endpoint) — decide when assembling the first sweep.
-- Whether `fruit-v1`'s manifest format should be extended with the new
-  `samples` covariate columns directly, or whether those are entered via
-  a separate per-specimen metadata file joined at import time — either
-  works; decide when capturing the dataset, not now.
-- `structured_output_mode`'s per-model capability table (which candidates
-  support strict `json_schema` vs. need `tool_call`/`json_object`) is
-  itself something that has to be discovered empirically per candidate —
-  not assumed, not hardcoded speculatively now.
-- `ICC`'s exact variant (one-way vs. two-way random/mixed, agreement vs.
-  consistency) — this doc picks ICC(1) one-way for simplicity; revisit if
-  the repeat-measurement design turns out to need a different model
-  (e.g. if "model" should be treated as a fixed rather than random
-  factor).
-
-## 12. Pre-implementation review — fixes applied in this revision (log, continued)
-
-Carried forward from the prior revision (already applied in
-`proxy/openrouter.py`): per-call `temperature`/`seed`, `usage.include`
-cost telemetry, optional `quantizations`, `RoutingPolicy`, connection-
-per-task SQLite handling, frozen-prompt-aware `protocol_compliant`,
-frozen-test-split guard, dev-only fit/prior provenance, image-resizing
-confound caveat, and the hygiene items (docstrings, Python version,
-dead ruff config) — see this doc's git history for the full table.
-
-New from the external methodology/engineering review, applied in this
-revision:
-
-| Area | Finding | Fix |
+| Appendix A (previous) | This spec | Why |
 |---|---|---|
-| Reproducibility | Stores what was asked for, not what was returned (no `system_fingerprint`, generation ID, provider served, request hash, reasoning/cached tokens, or exact timestamps). | New `run_attempts` columns (§7.2); requires a `proxy/openrouter.py` `CompletionResult` extension, tracked as outstanding in §6 — **not yet implemented**. |
-| Data model | `run_batches` had one `sample_id` with no parent object; a 54×6 sweep is 324 unrelated-looking rows. | New `sweeps` table (§7.2/§7.3) as the parent; `run_batches.sweep_id`. |
-| Data model (secondary) | No way to express a multi-view (`c1`+`c2` together) batch under a one-sample-per-batch model. | `primary_sample_id`/`batch_images` join table (§7.2), `views` column. |
-| Proportionality | Web layer/chart gallery/history filters risk costing more than the study they serve; mature tools (Inspect AI, promptfoo) already do much of this. | Evaluated Inspect AI directly (§13) — OpenRouter provider, image input, structured output, and epochs all confirmed to exist. Decision: **keep the custom build** and absorb the missing fields instead of adopting it, made explicitly rather than by default. |
-| Independent variables | Generation config (`reasoning` effort/budget, `top_p`, `max_tokens`), `structured_output_mode`, image format/quality/detail, `views`, and prompt-construction knobs (placement, persona, reference-card-stated, language, field order, confidence field) were not configurable/logged at all. | Added as explicit `run_batches` columns or a scoped `*_config` JSON column (§7.2); `observation/adapter.observe`'s signature extended (§8.2). |
-| Engineering | Reasoning-token budget exhaustion (`finish_reason: length`, empty content) would otherwise be mis-scored as a generic schema failure. | Detected explicitly in `adapter.observe`, recorded as `reasoning_budget_exhausted`, excluded from `schema_valid_rate` (§8.2/§8.7). |
-| Metrics | Missing Bland–Altman, ICC, median APE, R², Lin's CCC — all used in the cited 2026 domain studies. | Added to `bench/metrics.py` + corresponding chart kinds (§8.8/§8.9). |
-| Methodology (ISERN) | No open-model baseline, no explicit contamination statement, no human-validation-of-a-subset workflow. | §9 added: Qwen3-VL/Food-R1 as an open-model-candidate open item, contamination statement noted, `human_reviewed` column + sampling workflow. |
-
-## 13. Build-vs-buy: Inspect AI evaluation
-
-The external review's recommendation — "before building the web UI, spend
-half a day checking whether Inspect AI covers the harness" — was checked
-directly rather than assumed either way:
-
-- **Confirmed**: Inspect AI (UK AISI) has an OpenRouter provider
-  (`openrouter/<model>`, with `extra_body` passthrough for
-  `order`/`allow_fallbacks`/`require_parameters`-style routing), accepts
-  image inputs, supports structured output via `GenerateConfig.
-  response_schema`, supports repeated `epochs` with configurable score
-  reduction, ships a log viewer (`inspect view`), and exposes
-  `evals_df()`/`samples_df()`/`messages_df()`/`events_df()` for pandas-
-  based analysis.
-- **Gaps found**: no confirmed built-in capture of `system_fingerprint`;
-  cost tracking is a static price table (`set_model_cost()`), not
-  OpenRouter's live `usage.include`-reported cost — both would need a
-  custom metadata hook even under Inspect. A documented open issue
-  affects Gemini reasoning models via OpenRouter (reasoning-block/thought-
-  signature handling breaks tool calls) — not a direct blocker here since
-  this study doesn't use tool calling, but worth re-checking if
-  `structured_output_mode='tool_call'` is ever used with a Gemini
-  candidate.
-- **UI mismatch**: Inspect's interface is a log viewer over completed
-  eval runs, not an interactive "upload a photo, pick params, click run"
-  browser form — the explicit requirement behind building this web app in
-  the first place.
-- **Decision**: keep the custom FastAPI+SQLite build, absorb the review's
-  missing fields (§7–§9) rather than adopt Inspect AI or promptfoo as the
-  execution engine. Recorded here so this trade-off — more total
-  engineering, but one system fully owned and an interactive UI preserved
-  — isn't silently lost if revisited later.
+| 5 specimens/type, 2 dev / 3 test, 90 images | 8/type, 3 dev / 5 test, 144 images | within-type statistics on 3 specimens are degenerate; CIs need ~30 test specimens |
+| Spearman ρ ≥ 0.7 within type | pooled log-log slope β with type fixed effects | ρ on n = 3 takes only a few values |
+| Signed relative bias | geometric bias (mean log ratio) | symmetric for over/under-estimation |
+| Image-level bootstrap | specimen-cluster bootstrap | images and repeats aren't independent |
+| Temperature 0 required | 0 or provider default, fixed per arm | some reasoning endpoints reject 0 |
+| 768 px for top-2 only | unchanged, plus reasoning and views secondary arms | RQ6 |
+| `food-vision bench …` single command | `food-vision prestudy …` command group + web UI | hybrid |

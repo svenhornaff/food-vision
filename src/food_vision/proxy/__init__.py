@@ -7,21 +7,25 @@ See ``openrouter.py`` for the client and docs/dev/food-vision-concept.md
 from .model_provider import get_default_provider
 from .openrouter import (
     CompletionResult,
+    JsonObjectFormat,
     JsonSchemaFormat,
     ModelProvider,
     OpenRouterClient,
     OpenRouterError,
     RoutingMode,
+    RoutingPolicy,
     Usage,
 )
 
 __all__ = [
     "CompletionResult",
+    "JsonObjectFormat",
     "JsonSchemaFormat",
     "ModelProvider",
     "OpenRouterClient",
     "OpenRouterError",
     "RoutingMode",
+    "RoutingPolicy",
     "Usage",
     "get_default_provider",
 ]

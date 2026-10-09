@@ -16,6 +16,7 @@ from openai import APIStatusError
 
 from food_vision.config.settings import Settings
 from food_vision.proxy.openrouter import (
+    JsonObjectFormat,
     JsonSchemaFormat,
     OpenRouterClient,
     OpenRouterError,
@@ -42,13 +43,39 @@ def _fake_response(
     completion_tokens: int | None = 5,
     cost: float | None = 0.002,
     provider: str | None = "vendor-provider",
+    response_id: str | None = None,
+    model_resolved: str | None = None,
+    system_fingerprint: str | None = None,
+    native_finish_reason: str | None = None,
+    reasoning_text: str | None = None,
+    reasoning_tokens: int | None = None,
+    cached_tokens: int | None = None,
 ) -> SimpleNamespace:
-    usage = SimpleNamespace(
-        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cost=cost
+    completion_tokens_details = (
+        SimpleNamespace(reasoning_tokens=reasoning_tokens) if reasoning_tokens is not None else None
     )
-    message = SimpleNamespace(content=content)
-    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], usage=usage, provider=provider)
+    prompt_tokens_details = (
+        SimpleNamespace(cached_tokens=cached_tokens) if cached_tokens is not None else None
+    )
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost=cost,
+        completion_tokens_details=completion_tokens_details,
+        prompt_tokens_details=prompt_tokens_details,
+    )
+    message = SimpleNamespace(content=content, reasoning=reasoning_text)
+    choice = SimpleNamespace(
+        message=message, finish_reason=finish_reason, native_finish_reason=native_finish_reason
+    )
+    return SimpleNamespace(
+        choices=[choice],
+        usage=usage,
+        provider=provider,
+        id=response_id,
+        model=model_resolved,
+        system_fingerprint=system_fingerprint,
+    )
 
 
 def _api_status_error(status_code: int) -> APIStatusError:
@@ -292,3 +319,94 @@ def test_no_model_configured_raises() -> None:
     client, _ = _client_with_mock(_settings(OPENROUTER_DEFAULT_MODEL="", FOOD_VISION_MODELS=()))
     with pytest.raises(OpenRouterError, match="No model"):
         client.complete(messages=[])
+
+
+def test_top_p_max_tokens_reasoning_sent_only_when_given() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    client.complete(messages=[{"role": "user", "content": "hi"}])
+
+    kwargs = mock_create.call_args.kwargs
+    assert "top_p" not in kwargs
+    assert "max_tokens" not in kwargs
+    assert "reasoning" not in kwargs["extra_body"]
+
+
+def test_top_p_max_tokens_reasoning_forwarded_when_given() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    client.complete(
+        messages=[{"role": "user", "content": "hi"}],
+        top_p=0.9,
+        max_tokens=2048,
+        reasoning={"effort": "low"},
+    )
+
+    kwargs = mock_create.call_args.kwargs
+    assert kwargs["top_p"] == 0.9
+    assert kwargs["max_tokens"] == 2048
+    assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
+
+
+def test_json_object_format_sent_as_response_format() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response(content='{"foo": 1}')
+
+    client.complete(
+        messages=[{"role": "user", "content": "hi"}], response_format=JsonObjectFormat()
+    )
+
+    assert mock_create.call_args.kwargs["response_format"] == {"type": "json_object"}
+
+
+def test_completion_result_carries_telemetry_fields_when_present() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response(
+        response_id="gen-123",
+        model_resolved="vendor/model-a-v2",
+        system_fingerprint="fp_abc",
+        native_finish_reason="STOP",
+        reasoning_text="because X",
+        reasoning_tokens=7,
+        cached_tokens=3,
+    )
+
+    result = client.complete(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.generation_id == "gen-123"
+    assert result.model_resolved == "vendor/model-a-v2"
+    assert result.system_fingerprint == "fp_abc"
+    assert result.native_finish_reason == "STOP"
+    assert result.reasoning_text == "because X"
+    assert result.reasoning_tokens == 7
+    assert result.cached_tokens == 3
+
+
+def test_completion_result_telemetry_fields_default_to_none_when_absent() -> None:
+    """Minimal/mocked responses (most existing tests) must not raise."""
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    result = client.complete(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.generation_id is None
+    assert result.model_resolved is None
+    assert result.system_fingerprint is None
+    assert result.native_finish_reason is None
+    assert result.reasoning_text is None
+    assert result.reasoning_tokens is None
+    assert result.cached_tokens is None
+    assert result.raw == {}
+
+
+def test_completion_result_raw_uses_model_dump_when_available() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    response = _fake_response()
+    response.model_dump = lambda mode="python": {"id": "gen-999"}
+    mock_create.return_value = response
+
+    result = client.complete(messages=[{"role": "user", "content": "hi"}])
+
+    assert result.raw == {"id": "gen-999"}

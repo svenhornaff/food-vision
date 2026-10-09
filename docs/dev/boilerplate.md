@@ -111,10 +111,22 @@ food-vision/
 │       ├── config/
 │       │   ├── __init__.py
 │       │   └── settings.py       # pydantic-settings, lazy get_settings()
-│       ├── proxy/                # OpenRouter transport layer (this phase)
+│       ├── proxy/                # OpenRouter transport layer
 │       │   ├── __init__.py
 │       │   ├── openrouter.py     # OpenRouterClient, ModelProvider Protocol
 │       │   └── model_provider.py # get_default_provider() convenience factory
+│       ├── domain/               # pure, deterministic calculations
+│       │   ├── __init__.py
+│       │   └── calculator.py     # S2/B1 mass+kcal formulas (no fitted constants baked in)
+│       ├── imaging/              # decode/normalize; EXIF covariates
+│       │   ├── __init__.py
+│       │   ├── preprocess.py     # normalize(): HEIC decode, exif_transpose, resize, strip
+│       │   └── covariates.py     # extract(): make/model/focal length, read before stripping
+│       ├── observation/          # prompts, schemas, observe() adapter
+│       │   ├── __init__.py
+│       │   ├── schema.py         # per-strategy strict JSON schemas + validation
+│       │   ├── adapter.py        # observe(): message build, mode select, outcome classify
+│       │   └── prompts/          # fruit_s{1,2,3}_v1_en.md, loaded as package data
 │       └── utils/
 │           ├── __init__.py
 │           └── log_factory.py    # configure_logging() / get_logger()
@@ -125,19 +137,35 @@ food-vision/
 │       ├── test_settings.py
 │       ├── test_log_factory.py
 │       ├── test_openrouter.py
-│       └── test_model_provider.py
+│       ├── test_model_provider.py
+│       ├── test_calculator.py
+│       ├── test_preprocess.py
+│       ├── test_covariates.py
+│       ├── test_schema.py
+│       └── test_observation_adapter.py
 └── docs/
     └── dev/
         ├── food-vision-concept.md
+        ├── pre-study-web-ui.md    # implementation spec for the current phase (Phase P / M1–M6)
+        ├── pre-study-implementation.md  # superseded by the above; kept for history
         └── boilerplate.md        # this file
 ```
 
-**Not built yet** (concept doc §13's full layout — `api/`, `domain/`,
-`observation/`, `enrichment/`, `matching/`, `reference/`, `imaging/`,
-`pipeline/`, `cli.py`, `bench/`, `data/`): these are later phases (Phase 0
-onward in the concept's roadmap §14) and intentionally don't exist yet.
-Adding them before there's a reason to is the "over-engineering before
-evidence" risk the concept doc itself calls out in §15.
+**Built so far: M1 only** (docs/dev/pre-study-web-ui.md §10 milestones).
+M1's exit criterion — "`observe()` returns a classified `Observation` from
+a recorded fixture" — is met: `domain/calculator.py`, `imaging/`,
+`observation/` all exist, are fully unit-tested with no network I/O, and
+`proxy/openrouter.py` carries the §7.4 telemetry extension (`generation_id`,
+`model_resolved`, `system_fingerprint`, `native_finish_reason`,
+`reasoning_text`/`reasoning_tokens`, `cached_tokens`, `raw`, plus `top_p`/
+`max_tokens`/`reasoning` on `complete()`).
+
+**Not built yet** (M2–M6, same doc): `prestudy/` (db, dataset, fits,
+configs, protocols, sweeps, executor, analysis, charts, report, web UI),
+`cli.py`. Also still deferred to Phase 0+ (concept §13): `api/`,
+`enrichment/`, `matching/`, `reference/`, `pipeline/`. Adding any of these
+before there's a reason to is the "over-engineering before evidence" risk
+the concept doc calls out in §15.
 
 ---
 
@@ -152,6 +180,9 @@ dependencies = [
   "pydantic-settings>=2.10.1,<3.0.0",
   "openai>=1.60.0",
   "httpx>=0.27.0",
+  "pillow>=11,<12",
+  "pillow-heif>=0.18",
+  "numpy>=2.0",
 ]
 
 [dependency-groups]
@@ -171,7 +202,7 @@ exclude = ["tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--tb=short", "-p", "no:logging",
-           "--cov=src/food_vision", "--cov-report=term-missing", "--cov-fail-under=60"]
+           "--cov=src/food_vision", "--cov-report=term-missing", "--cov-fail-under=85"]
 ```
 
 Notes:
@@ -185,9 +216,11 @@ Notes:
   `-p logging` back on for just that module via `@pytest.mark.parametrize`
   or a dedicated `pytest.ini` marker — don't remove the global flag without
   re-checking `tests/unit/test_log_factory.py`.
-- `--cov-fail-under=60` is a floor, not a target — raise it as real
-  coverage grows past the current ~97% (easy right now because the surface
-  area is small; don't let it regress as the domain/API layers land).
+- `--cov-fail-under=85` is pre-study-web-ui.md §9's floor for
+  `prestudy/`/`observation/`/`imaging/`/`domain/`; actual coverage is
+  currently ~98% (one global floor, not split per package —
+  `pytest-cov` doesn't make a per-path floor convenient, and the whole
+  codebase is small enough that splitting it wouldn't buy much yet).
 - No `[project.scripts]` entry point yet. The concept doc's `typer`-based
   CLI (`food-vision analyze|bench|build-reference`) is Phase 0+ work;
   it'll get its own `cli.py` and script entry when it exists, not before.
@@ -241,19 +274,29 @@ as the etf-portfolio boilerplate doc's own table):**
 
 - `tests/unit/` only, for now — no `integration/` directory because there's
   nothing requiring a live dependency (DB, HTTP server) to test against
-  yet. The concept doc's `tests/{unit,property,integration}` layout (§13)
-  is the target once the domain/calculator and API layers exist.
-- All OpenRouter tests are mocked at `OpenRouterClient._client` — no
-  network I/O, no real API key required to run the suite.
+  yet, and no `property/` directory because the calculator's property
+  checks (monotonicity, positivity) are written as parametrized `pytest`
+  cases rather than `hypothesis` so far — add `hypothesis` when M2's
+  `fits.py` needs it, not before. The concept doc's
+  `tests/{unit,property,integration}` layout (§13) is still the target
+  once the API layer exists.
+- All OpenRouter tests are mocked at `OpenRouterClient._client`; all
+  `observation.adapter.observe()` tests use a fake `ModelProvider` — no
+  network I/O, no real API key required to run the suite, matching
+  pre-study-web-ui.md §9's "no live network calls" rule.
 - Minimum bar covered today: settings import-safety + allowlist
-  validation, logging idempotency/no-filesystem-side-effects, and the
-  proxy's request-building, routing-mode, retry/backoff and telemetry
-  behavior (see `tests/unit/test_openrouter.py` for the full list:
-  deterministic request shape, allowlist rejection, production vs
-  benchmark provider-routing payloads, 429/5xx-only retries capped at
-  `OPENROUTER_MAX_RETRIES`, non-retryable 4xx failing immediately, and
-  `cost_is_estimate` flagging when OpenRouter doesn't report a cost).
-- Run: `make test` (`uv run pytest`, coverage floor 60%, currently ~97%).
+  validation, logging idempotency/no-filesystem-side-effects, the proxy's
+  request-building/routing-mode/retry/backoff/telemetry behavior
+  (`test_openrouter.py`), image normalization determinism + EXIF
+  orientation + metadata stripping + the decoded-pixel guard + a real HEIC
+  fixture (`test_preprocess.py`), EXIF covariate extraction without
+  mutating the source bytes (`test_covariates.py`), per-strategy schema
+  validation (`test_schema.py`), and `observe()`'s message shape, mode
+  selection and `ok`/`invalid`/`refused`/`truncated` outcome
+  classification including the reasoning-budget-exhaustion case
+  (`test_observation_adapter.py`). Pure-formula monotonicity/positivity
+  checks for `domain/calculator.py` (`test_calculator.py`).
+- Run: `make test` (`uv run pytest`, coverage floor 85%, currently ~98%).
 
 ---
 
@@ -298,11 +341,21 @@ nothing about meal observation, prompts, or schemas (that's
   and logged; `cost_is_estimate=True` only when OpenRouter still didn't
   report a cost despite `usage.include`, so a caller never silently treats
   a missing cost as zero.
-- `ModelProvider` is a `Protocol`, not a base class — a future
-  `observation/adapter.py` implementation can depend on this Protocol
-  without importing `OpenRouterClient` directly, matching the concept's
-  "adapter Protocol + OpenRouter implementation" package design (§13)
-  without building the rest of that package yet.
+- `ModelProvider` is a `Protocol`, not a base class — `observation/adapter.py`
+  depends on this Protocol (and a test fake implementing it) without
+  importing `OpenRouterClient` directly, matching the concept's "adapter
+  Protocol + OpenRouter implementation" package design (§13).
+- `complete()` also accepts `top_p`, `max_tokens` and `reasoning` (a dict
+  forwarded as OpenRouter's `reasoning` block), all `None`/omitted by
+  default; `response_format` accepts `JsonObjectFormat` as well as
+  `JsonSchemaFormat`, for models without strict-schema support.
+  `CompletionResult` carries `generation_id`, `model_resolved`,
+  `system_fingerprint`, `native_finish_reason`, `reasoning_text`/
+  `reasoning_tokens`, `cached_tokens` and the full `raw` response dict
+  (pre-study-web-ui.md §7.4) — all extracted defensively (`getattr(...,
+  None)`) so minimal/mocked responses never raise, and all default to
+  `None`/`{}` so existing callers that construct a bare `CompletionResult`
+  don't break.
 
 ---
 
@@ -333,19 +386,26 @@ table for the reasoning on the first three).
 [x] pyproject.toml: dependency groups + ruff/mypy/pytest config
 [x] src/food_vision/: config/settings.py (lazy), utils/log_factory.py,
     proxy/ (OpenRouterClient + ModelProvider Protocol)
-[x] tests/unit/: settings, logging, proxy — ~97% coverage, no network I/O
+[x] tests/unit/: settings, logging, proxy — no network I/O
 [x] .gitignore + .env.example + this boilerplate doc
 [x] Makefile: build-env/format/lint/test/clean/ci
-[ ] domain/ (MealAnalysis, Item, Observation, calculator) — Phase 0/1
-[ ] observation/ (Protocol + OpenRouter implementation using proxy/,
-    schema.py, prompts/) — Phase 0
-[ ] reference/ (BLS 4.0 + FDC + OFF → reference.db) — Phase 0
-[ ] cli.py (typer: analyze, bench, build-reference) — Phase 0
+[x] M1 (pre-study-web-ui.md §10): proxy/openrouter.py §7.4 telemetry
+    extension, domain/calculator.py, imaging/ (preprocess + covariates),
+    observation/ (schema + prompts + adapter) — 98% coverage, no network I/O
+[ ] M2: prestudy/{db,dataset,fits,configs,protocols,sweeps,executor}.py,
+    cli.py — dev sweep of 1 model x S1 runs, is killed, resumes, completes
+    within budget
+[ ] M3: capture fruit-v1 (144 images; can run in parallel from day 1)
+[ ] M4: smoke, dev exploration, prompt iteration, fits
+[ ] M5: prestudy/{analysis,charts,report}.py, prestudy/web/ — analyze
+    reproduces fixtures; probe + attempt review usable
+[ ] M6: protocol freeze → test sweep → analyze → decision.md
+[ ] reference/ (BLS 4.0 + FDC + OFF → reference.db) — Phase 0 (concept §14)
 [ ] api/ (FastAPI routes) — Phase 1
 [ ] enrichment/, matching/ — Phase 1
-[ ] bench/ harness — Phase 2
 ```
 
-Each unchecked item is a concept-doc phase (§14) with its own exit
-criteria — don't pull one forward without the evidence/dependency that
-phase's exit criteria calls for.
+Each unchecked item is either a pre-study milestone
+(docs/dev/pre-study-web-ui.md §10) or a concept-doc phase (§14) with its
+own exit criteria — don't pull one forward without the evidence/dependency
+that milestone/phase calls for.

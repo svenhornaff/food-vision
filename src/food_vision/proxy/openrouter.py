@@ -20,7 +20,7 @@ import json
 import random
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -107,6 +107,20 @@ class JsonSchemaFormat:
 
 
 @dataclass(frozen=True)
+class JsonObjectFormat:
+    """A ``response_format: json_object`` request.
+
+    Used instead of :class:`JsonSchemaFormat` for models that don't support
+    strict JSON-schema structured output (pre-study §7.3/§7.4) — the caller
+    is responsible for appending the schema to the prompt text and
+    validating the parsed result itself.
+    """
+
+    def as_response_format(self) -> dict[str, Any]:
+        return {"type": "json_object"}
+
+
+@dataclass(frozen=True)
 class Usage:
     """Provider-reported usage/cost. ``cost_is_estimate`` is ``True`` only
     when OpenRouter didn't report a cost and none can be derived — the
@@ -138,6 +152,20 @@ class CompletionResult:
     #: Temperature/seed actually sent, after ``Settings`` fallback.
     temperature: float
     seed: int | None
+    #: Reproducibility/telemetry fields the pre-study harness needs
+    #: (docs/dev/pre-study-web-ui.md §7.4). Defensive on extraction: mocked
+    #: or minimal SDK responses that don't set these attributes yield
+    #: ``None`` rather than raising.
+    generation_id: str | None = None
+    model_resolved: str | None = None
+    system_fingerprint: str | None = None
+    native_finish_reason: str | None = None
+    reasoning_text: str | None = None
+    reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    #: Full response body, best-effort JSON-able dict. Never logged — may
+    #: contain model-generated text. Empty dict if it can't be derived.
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 class ModelProvider(Protocol):
@@ -152,12 +180,15 @@ class ModelProvider(Protocol):
         self,
         *,
         messages: Sequence[dict[str, Any]],
-        response_format: JsonSchemaFormat | None = None,
+        response_format: JsonSchemaFormat | JsonObjectFormat | None = None,
         model: str | None = None,
         routing_mode: RoutingMode = RoutingMode.PRODUCTION,
         routing_policy: RoutingPolicy | None = None,
         temperature: float | None = None,
         seed: int | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> CompletionResult: ...
 
 
@@ -202,19 +233,25 @@ class OpenRouterClient:
         self,
         *,
         messages: Sequence[dict[str, Any]],
-        response_format: JsonSchemaFormat | None = None,
+        response_format: JsonSchemaFormat | JsonObjectFormat | None = None,
         model: str | None = None,
         routing_mode: RoutingMode = RoutingMode.PRODUCTION,
         routing_policy: RoutingPolicy | None = None,
         temperature: float | None = None,
         seed: int | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+        reasoning: dict[str, Any] | None = None,
     ) -> CompletionResult:
         """Run one chat-completion request against OpenRouter.
 
         ``routing_policy``, ``temperature`` and ``seed`` override the
         configured :class:`Settings` defaults for this call only — the
         pre-study benchmark harness varies these per run; production code
-        can omit them and get the process-wide defaults.
+        can omit them and get the process-wide defaults. ``top_p``,
+        ``max_tokens`` and ``reasoning`` (OpenRouter's reasoning-effort/
+        budget block, forwarded as-is) are only sent when given — most
+        callers don't need them.
 
         Raises:
             OpenRouterError: model not on the allowlist, benchmark routing
@@ -229,6 +266,10 @@ class OpenRouterClient:
         )
         effective_seed = seed if seed is not None else self._settings.OPENROUTER_SEED
 
+        extra_body: dict[str, Any] = {"provider": provider_payload, "usage": {"include": True}}
+        if reasoning is not None:
+            extra_body["reasoning"] = reasoning
+
         request_kwargs: dict[str, Any] = {
             "model": model_id,
             "messages": list(messages),
@@ -239,10 +280,14 @@ class OpenRouterClient:
             # ``cost_is_estimate=True`` (concept §9: "Provider-reported usage
             # and cost logged; estimates marked." — this is what makes a
             # *reported*, not estimated, cost possible at all).
-            "extra_body": {"provider": provider_payload, "usage": {"include": True}},
+            "extra_body": extra_body,
         }
         if effective_seed is not None:
             request_kwargs["seed"] = effective_seed
+        if top_p is not None:
+            request_kwargs["top_p"] = top_p
+        if max_tokens is not None:
+            request_kwargs["max_tokens"] = max_tokens
         if response_format is not None:
             request_kwargs["response_format"] = response_format.as_response_format()
 
@@ -255,6 +300,7 @@ class OpenRouterClient:
         parsed = _try_parse_json(content) if response_format is not None else None
         usage = _extract_usage(response)
         provider_name = getattr(response, "provider", None)
+        message = choice.message
 
         logger.info(
             "openrouter.completion model=%s provider=%s routing=%s attempts=%d latency_ms=%.0f "
@@ -286,6 +332,22 @@ class OpenRouterClient:
             effective_routing_policy=provider_payload,
             temperature=effective_temperature,
             seed=effective_seed,
+            generation_id=getattr(response, "id", None),
+            model_resolved=getattr(response, "model", None),
+            system_fingerprint=getattr(response, "system_fingerprint", None),
+            native_finish_reason=getattr(choice, "native_finish_reason", None),
+            reasoning_text=getattr(message, "reasoning", None),
+            reasoning_tokens=_usage_detail(
+                usage_obj=getattr(response, "usage", None),
+                details_attr="completion_tokens_details",
+                field_attr="reasoning_tokens",
+            ),
+            cached_tokens=_usage_detail(
+                usage_obj=getattr(response, "usage", None),
+                details_attr="prompt_tokens_details",
+                field_attr="cached_tokens",
+            ),
+            raw=_response_as_dict(response),
         )
 
     def _resolve_model(self, model: str | None) -> str:
@@ -350,6 +412,37 @@ class OpenRouterClient:
     def _backoff_delay(self, attempt: int) -> float:
         base = min(2 ** (attempt - 1) * 0.5, 4.0)
         return float(base + self._random_fn() * 0.25)
+
+
+def _usage_detail(*, usage_obj: Any, details_attr: str, field_attr: str) -> int | None:
+    """Read a nested usage-detail field (reasoning/cached tokens).
+
+    Defensive: most mocked responses in tests, and some real providers,
+    don't set these nested objects at all.
+    """
+    details = getattr(usage_obj, details_attr, None)
+    if details is None:
+        return None
+    value = getattr(details, field_attr, None)
+    return int(value) if value is not None else None
+
+
+def _response_as_dict(response: Any) -> dict[str, Any]:
+    """Best-effort full response body as a plain dict.
+
+    Real ``openai`` SDK responses are pydantic models (``model_dump``);
+    test doubles are plain objects without it — those fall back to an
+    empty dict rather than raising.
+    """
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="json")
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return {}
 
 
 def _try_parse_json(content: str) -> dict[str, Any] | None:
