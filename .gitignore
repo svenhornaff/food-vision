@@ -22,6 +22,14 @@ htmlcov/
 # Logs (none written by default; reserved for future opt-in file logging)
 logs/
 
+# Pre-study run outputs (docs/dev/pre-study.md §9): results.jsonl and
+# anything else under bench/runs/ is regenerable; keep split.csv (the
+# committed dev/holdout assignment) and models.toml (capability notes).
+bench/runs/**
+!bench/runs/**/
+!bench/runs/**/split.csv
+!bench/runs/**/models.toml
+
 # macOS
 .DS_Store
 
