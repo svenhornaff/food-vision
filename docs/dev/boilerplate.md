@@ -32,9 +32,7 @@ it's already there.
   `food_vision.config.settings` must never raise just because
   `OPENROUTER_API_KEY` isn't set in the current shell — credentials are
   only required when something actually calls `get_settings()` /
-  constructs a client that needs them. This was a real bug fixed in this
-  refactor (the previous `Settings()` instantiated itself at module import
-  time) and is worth keeping as a hard rule.
+  constructs a client that needs them. Keep this as a hard rule.
 - **Centralized logging from day one** — one `configure_logging()` call at
   startup, `get_logger(__name__)` everywhere else, no scattered
   `logging.basicConfig()` calls, no side effects (no forced file handler,
@@ -72,9 +70,8 @@ uv sync                       # reads .python-version, creates .venv/, installs 
 - `.venv/` is always gitignored — disposable, `rm -rf .venv && uv sync`
   rebuilds identically.
 - The package installs in editable mode (`uv_build` + `src` layout), so
-  `import food_vision` resolves to `src/food_vision/` without any `PYTHONPATH`
-  or `sys.path` hacking — note the previous `Settings.__init__` inserted
-  `PROJECT_ROOT` into `sys.path` manually; that's gone, it was never needed.
+  `import food_vision` resolves to `src/food_vision/` without any
+  `PYTHONPATH` or `sys.path` hacking.
 
 ## 3. uv — dependencies
 
@@ -89,9 +86,9 @@ uv add --dev pytest pytest-cov ruff mypy
 Lock rule: **`uv.lock` committed** — reproducible builds, same as any
 application (not a published library).
 
-**Dropped from the previous dependency set, and why:**
+**Deliberately not a dependency, and why:**
 
-| Dropped | Reason |
+| Not used | Reason |
 |---|---|
 | `langchain`, `langchain-core`, `langchain-community`, `langchain-openai` | Concept doc §5: "AI gateway: OpenRouter via `openai` client with `base_url` override; thin adapter; no agent framework." LangChain was pulling in an agent-framework abstraction (multi-provider chat model base classes, embeddings, tool-calling scaffolding) that nothing in the concept plan uses. Calling OpenRouter's OpenAI-compatible endpoint directly with the `openai` SDK is both what the concept asks for and strictly less code. |
 
@@ -191,11 +188,9 @@ Notes:
 - `--cov-fail-under=60` is a floor, not a target — raise it as real
   coverage grows past the current ~97% (easy right now because the surface
   area is small; don't let it regress as the domain/API layers land).
-- No `[project.scripts]` entry point. The previous `pyproject.toml`
-  declared `food-vision = "food_vision:main"` but `main` never existed —
-  a broken console script. The concept doc's `typer`-based CLI
-  (`food-vision analyze|bench|build-reference`) is Phase 0+ work; it'll get
-  its own `cli.py` and script entry when it exists, not before.
+- No `[project.scripts]` entry point yet. The concept doc's `typer`-based
+  CLI (`food-vision analyze|bench|build-reference`) is Phase 0+ work;
+  it'll get its own `cli.py` and script entry when it exists, not before.
 - `pyrightconfig` lives inline as `[tool.pyright]` (`venvPath = "."`,
   `venv = ".venv"`) so editor/LSP tooling resolves the project's own
   virtualenv instead of whatever interpreter happens to be first on `PATH`.
@@ -215,12 +210,9 @@ as the etf-portfolio boilerplate doc's own table):**
 
 - **`src/food_vision/config/settings.py`**: one `Settings` class
   (`pydantic-settings`), accessed via `get_settings()` — an `lru_cache`'d
-  function, not a module-level singleton constructed at import time. This
-  is the one change in this refactor worth over-explaining: the previous
-  version ran `settings = Settings()` at module scope, so *any* import of
-  this module (including from a test that doesn't care about OpenRouter)
-  raised `RuntimeError` if `OPENROUTER_API_KEY` wasn't in the environment.
-  `get_settings()` defers that to first call.
+  function, not a module-level singleton constructed at import time, so
+  importing this module never fails just because `OPENROUTER_API_KEY`
+  isn't set; validation happens once, on first `get_settings()` call.
 - Settings today cover exactly what `proxy/` needs: OpenRouter
   credentials/endpoint, the `FOOD_VISION_MODELS` allowlist + default/
   fallback models (concept §9), provider-routing flags
@@ -233,12 +225,8 @@ as the etf-portfolio boilerplate doc's own table):**
   future CLI's `main()`, a future FastAPI `lifespan`, or a test fixture);
   `get_logger(__name__)` everywhere else. No class, no singleton, no
   filesystem side effects, idempotent (repeated `configure_logging()`
-  calls are a no-op once the root logger has handlers). This follows the
-  pattern in `../bulliexplorer/app/utils/log_factory.py` rather than the
-  previous `LoggingFactory` singleton class, which unconditionally created
-  a `logs/` directory and a `RotatingFileHandler` on every `get_logger()`
-  call — a side effect on *every import*, including in tests, and it wiped
-  the root logger's existing handlers in `__new__`.
+  calls are a no-op once the root logger has handlers) — the pattern in
+  `../bulliexplorer/app/utils/log_factory.py`.
 - **Never log secrets, prompts, images or meal content** (concept §11).
   `OpenRouterClient.complete()` logs model, provider, routing mode, attempt
   count, latency, token counts and cost only — never message content,
@@ -278,13 +266,27 @@ nothing about meal observation, prompts, or schemas (that's
 - `OpenRouterClient` wraps `openai.OpenAI(base_url=..., api_key=...)`
   directly; the SDK's own retry logic is disabled (`max_retries=0`) so the
   adapter's own policy is the only one in effect.
-- Every request sets `temperature` from settings (default `0`), an
-  optional fixed `seed`, and an OpenRouter `provider` block with
-  `require_parameters`, `data_collection` (`"deny"` by default) and `zdr`.
+- Every request sets `temperature` and `seed` from settings by default,
+  each overridable per call (`complete(temperature=..., seed=...)`) —
+  the pre-study harness varies these per run without env-file edits — and
+  an OpenRouter `provider` block with `require_parameters`,
+  `data_collection` (`"deny"` by default) and `zdr`.
 - `RoutingMode.PRODUCTION` uses the configured provider order with
-  `allow_fallbacks` from settings; `RoutingMode.BENCHMARK` requires an
-  explicit `provider_pin` + `quantizations` and forces
-  `allow_fallbacks: false` — reproducibility for benchmark runs per §9.
+  `allow_fallbacks` from settings; `RoutingMode.BENCHMARK` takes a
+  `RoutingPolicy` (`provider_pin` required, `quantizations`/`zdr`/
+  `data_collection` optional overrides) and forces `allow_fallbacks: false`
+  — reproducibility for benchmark runs per §9. `quantizations` is
+  deliberately optional: several candidates (Gemini/GPT/Claude on
+  OpenRouter) publish no quantization label at all, so requiring one would
+  silently exclude them rather than do nothing.
+- Every request sets `extra_body.usage.include = true` so OpenRouter
+  reports actual provider cost on the response; without it `usage.cost` is
+  absent on most requests and every row would be flagged
+  `cost_is_estimate=True` regardless of what actually happened.
+- `CompletionResult.effective_routing_policy` carries the exact `provider`
+  block that was sent, so a caller that varies routing per call can record
+  what was effective alongside the result instead of reconstructing it
+  from inputs later.
 - Retries only on HTTP 429/5xx, capped at `OPENROUTER_MAX_RETRIES` (default
   2 retries → 3 attempts total), with a jittered exponential backoff
   (`sleep`/`random_fn` are constructor-injectable for tests).
@@ -293,8 +295,9 @@ nothing about meal observation, prompts, or schemas (that's
   JSON Schema + `strict`); the adapter has no opinion on what schema that
   is — no observation schema lives here.
 - Usage/cost telemetry (`Usage`) is extracted from OpenRouter's response
-  and logged; `cost_is_estimate=True` when OpenRouter didn't report a cost,
-  so a caller never silently treats a missing cost as zero.
+  and logged; `cost_is_estimate=True` only when OpenRouter still didn't
+  report a cost despite `usage.include`, so a caller never silently treats
+  a missing cost as zero.
 - `ModelProvider` is a `Protocol`, not a base class — a future
   `observation/adapter.py` implementation can depend on this Protocol
   without importing `OpenRouterClient` directly, matching the concept's

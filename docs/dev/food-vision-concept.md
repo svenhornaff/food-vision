@@ -123,7 +123,7 @@ The first milestone is an **evidence-driven proof of concept**, not a diary app.
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Runtime | Python 3.13 | 3.14 acceptable |
+| Runtime | Python 3.12 | 3.13 acceptable |
 | Packaging | `uv`, `pyproject.toml`, `src` layout, `hatchling` | Lockfile committed |
 | Lint / format / types | `ruff` (pycodestyle, pyflakes, isort, pep8-naming, bugbear), `mypy --strict` | PEP 8 enforced in CI, not by convention |
 | API | FastAPI + Uvicorn | Multipart uploads, OpenAPI |
@@ -557,7 +557,7 @@ Appendix A. Weighed single-fruit set, frozen dev/test split, 6–8 candidate mod
 | ID | Decision | Status |
 |---|---|---|
 | ADR-001 | OpenRouter as initial inference gateway | Accepted |
-| ADR-002 | Python 3.13, `uv`, FastAPI, Pydantic v2, ruff + mypy in CI | Accepted |
+| ADR-002 | Python 3.12, `uv`, FastAPI, Pydantic v2, ruff + mypy in CI | Accepted |
 | ADR-003 | Vision observes; deterministic code calculates; no nutrient ever from the model | Accepted |
 | ADR-004 | Inference credentials backend-only | Accepted |
 | ADR-005 | Versioned HTTP API, PWA first | Proposed |

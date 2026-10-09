@@ -40,16 +40,51 @@ class RoutingMode(StrEnum):
     """Which OpenRouter ``provider`` routing policy to apply.
 
     - ``PRODUCTION``: fallbacks among the approved provider list.
-    - ``BENCHMARK``: exactly one pinned provider, explicit quantizations,
-      ``allow_fallbacks: false`` — reproducibility for benchmark runs.
+    - ``BENCHMARK``: exactly one pinned provider, ``allow_fallbacks: false``
+      — reproducibility for benchmark runs. Quantization is an *optional*
+      extra pin (``RoutingPolicy.quantizations``): several benchmark
+      candidates (e.g. Gemini, GPT, Claude endpoints on OpenRouter) don't
+      publish quantization labels at all, so requiring one would silently
+      exclude them.
     """
 
     PRODUCTION = "production"
     BENCHMARK = "benchmark"
 
 
+_VALID_DATA_COLLECTION = frozenset({"allow", "deny"})
+
+
 class OpenRouterError(RuntimeError):
     """Raised for a non-retryable OpenRouter failure or exhausted retries."""
+
+
+@dataclass(frozen=True)
+class RoutingPolicy:
+    """Per-call override of OpenRouter provider-routing knobs.
+
+    Every field left ``None`` falls back to the configured :class:`Settings`
+    default. This exists so a caller (e.g. the pre-study benchmark harness)
+    can vary privacy/routing per run — not just via process-wide env vars —
+    and record the *effective* policy it used alongside the result, rather
+    than one env-file edit and restart per candidate model/provider
+    combination.
+
+    ``provider_pin`` is required when used with ``RoutingMode.BENCHMARK``;
+    ``quantizations`` is optional there (see :class:`RoutingMode`).
+    """
+
+    provider_pin: str | None = None
+    quantizations: Sequence[str] | None = None
+    zdr: bool | None = None
+    data_collection: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.data_collection is not None and self.data_collection not in _VALID_DATA_COLLECTION:
+            raise OpenRouterError(
+                f"RoutingPolicy.data_collection must be one of {sorted(_VALID_DATA_COLLECTION)}, "
+                f"got {self.data_collection!r}."
+            )
 
 
 @dataclass(frozen=True)
@@ -95,6 +130,14 @@ class CompletionResult:
     usage: Usage
     finish_reason: str | None
     attempts: int
+    #: The OpenRouter ``provider`` block actually sent (pin, quantizations,
+    #: zdr, data_collection, allow_fallbacks) — a caller that varies routing
+    #: per call (e.g. the pre-study harness) records this alongside the
+    #: result instead of having to reconstruct it from inputs.
+    effective_routing_policy: dict[str, Any]
+    #: Temperature/seed actually sent, after ``Settings`` fallback.
+    temperature: float
+    seed: int | None
 
 
 class ModelProvider(Protocol):
@@ -112,8 +155,9 @@ class ModelProvider(Protocol):
         response_format: JsonSchemaFormat | None = None,
         model: str | None = None,
         routing_mode: RoutingMode = RoutingMode.PRODUCTION,
-        provider_pin: str | None = None,
-        quantizations: Sequence[str] | None = None,
+        routing_policy: RoutingPolicy | None = None,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> CompletionResult: ...
 
 
@@ -161,27 +205,44 @@ class OpenRouterClient:
         response_format: JsonSchemaFormat | None = None,
         model: str | None = None,
         routing_mode: RoutingMode = RoutingMode.PRODUCTION,
-        provider_pin: str | None = None,
-        quantizations: Sequence[str] | None = None,
+        routing_policy: RoutingPolicy | None = None,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> CompletionResult:
         """Run one chat-completion request against OpenRouter.
 
+        ``routing_policy``, ``temperature`` and ``seed`` override the
+        configured :class:`Settings` defaults for this call only — the
+        pre-study benchmark harness varies these per run; production code
+        can omit them and get the process-wide defaults.
+
         Raises:
             OpenRouterError: model not on the allowlist, benchmark routing
-                missing its required pin/quantizations, or the request
-                failed (non-retryable status, or retries exhausted).
+                missing its required provider pin, or the request failed
+                (non-retryable status, or retries exhausted).
         """
         model_id = self._resolve_model(model)
-        provider_payload = self._build_provider_payload(routing_mode, provider_pin, quantizations)
+        policy = routing_policy or RoutingPolicy()
+        provider_payload = self._build_provider_payload(routing_mode, policy)
+        effective_temperature = (
+            temperature if temperature is not None else self._settings.OPENROUTER_TEMPERATURE
+        )
+        effective_seed = seed if seed is not None else self._settings.OPENROUTER_SEED
 
         request_kwargs: dict[str, Any] = {
             "model": model_id,
             "messages": list(messages),
-            "temperature": self._settings.OPENROUTER_TEMPERATURE,
-            "extra_body": {"provider": provider_payload},
+            "temperature": effective_temperature,
+            # ``usage.include`` asks OpenRouter to report actual provider
+            # cost on this response; without it ``usage.cost`` is absent on
+            # most requests and every row would be flagged
+            # ``cost_is_estimate=True`` (concept §9: "Provider-reported usage
+            # and cost logged; estimates marked." — this is what makes a
+            # *reported*, not estimated, cost possible at all).
+            "extra_body": {"provider": provider_payload, "usage": {"include": True}},
         }
-        if self._settings.OPENROUTER_SEED is not None:
-            request_kwargs["seed"] = self._settings.OPENROUTER_SEED
+        if effective_seed is not None:
+            request_kwargs["seed"] = effective_seed
         if response_format is not None:
             request_kwargs["response_format"] = response_format.as_response_format()
 
@@ -197,12 +258,15 @@ class OpenRouterClient:
 
         logger.info(
             "openrouter.completion model=%s provider=%s routing=%s attempts=%d latency_ms=%.0f "
-            "tokens_in=%s tokens_out=%s cost_usd=%s cost_is_estimate=%s finish_reason=%s",
+            "temperature=%s seed=%s tokens_in=%s tokens_out=%s cost_usd=%s cost_is_estimate=%s "
+            "finish_reason=%s",
             model_id,
             provider_name,
             routing_mode.value,
             attempts,
             latency_ms,
+            effective_temperature,
+            effective_seed,
             usage.input_tokens,
             usage.output_tokens,
             usage.cost_usd,
@@ -219,6 +283,9 @@ class OpenRouterClient:
             usage=usage,
             finish_reason=choice.finish_reason,
             attempts=attempts,
+            effective_routing_policy=provider_payload,
+            temperature=effective_temperature,
+            seed=effective_seed,
         )
 
     def _resolve_model(self, model: str | None) -> str:
@@ -233,22 +300,24 @@ class OpenRouterClient:
     def _build_provider_payload(
         self,
         routing_mode: RoutingMode,
-        provider_pin: str | None,
-        quantizations: Sequence[str] | None,
+        policy: RoutingPolicy,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "require_parameters": self._settings.OPENROUTER_REQUIRE_PARAMETERS,
-            "data_collection": self._settings.OPENROUTER_DATA_COLLECTION,
-            "zdr": self._settings.OPENROUTER_ZDR,
+            "data_collection": policy.data_collection or self._settings.OPENROUTER_DATA_COLLECTION,
+            "zdr": policy.zdr if policy.zdr is not None else self._settings.OPENROUTER_ZDR,
         }
         if routing_mode is RoutingMode.BENCHMARK:
-            if not provider_pin:
-                raise OpenRouterError("Benchmark routing requires provider_pin.")
-            if not quantizations:
-                raise OpenRouterError("Benchmark routing requires explicit quantizations.")
-            payload["order"] = [provider_pin]
+            if not policy.provider_pin:
+                raise OpenRouterError("Benchmark routing requires routing_policy.provider_pin.")
+            payload["order"] = [policy.provider_pin]
             payload["allow_fallbacks"] = False
-            payload["quantizations"] = list(quantizations)
+            # Quantization is optional pinning, not a requirement: several
+            # benchmark candidates don't publish quantization labels at all
+            # (concept review fix #3) — requiring one would silently exclude
+            # them rather than just doing nothing.
+            if policy.quantizations:
+                payload["quantizations"] = list(policy.quantizations)
         else:
             payload["allow_fallbacks"] = self._settings.OPENROUTER_ALLOW_FALLBACKS
             if self._settings.OPENROUTER_PROVIDER_ORDER:

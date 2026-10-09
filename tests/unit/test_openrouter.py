@@ -20,6 +20,7 @@ from food_vision.proxy.openrouter import (
     OpenRouterClient,
     OpenRouterError,
     RoutingMode,
+    RoutingPolicy,
 )
 
 
@@ -92,12 +93,16 @@ def test_complete_sends_deterministic_request_and_parses_json() -> None:
     assert kwargs["extra_body"]["provider"]["require_parameters"] is True
     assert kwargs["extra_body"]["provider"]["data_collection"] == "deny"
     assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert kwargs["extra_body"]["usage"] == {"include": True}
 
     assert result.parsed == {"foo": "bar"}
     assert result.attempts == 1
     assert result.usage.cost_usd == 0.002
     assert result.usage.cost_is_estimate is False
     assert result.provider == "vendor-provider"
+    assert result.temperature == 0.0
+    assert result.seed is None
+    assert result.effective_routing_policy == kwargs["extra_body"]["provider"]
 
 
 def test_complete_without_response_format_does_not_parse_json() -> None:
@@ -121,9 +126,22 @@ def test_seed_included_when_configured() -> None:
     client, mock_create = _client_with_mock(_settings(OPENROUTER_SEED=42))
     mock_create.return_value = _fake_response()
 
-    client.complete(messages=[{"role": "user", "content": "hi"}])
+    result = client.complete(messages=[{"role": "user", "content": "hi"}])
 
     assert mock_create.call_args.kwargs["seed"] == 42
+    assert result.seed == 42
+
+
+def test_temperature_and_seed_overridable_per_call() -> None:
+    client, mock_create = _client_with_mock(_settings(OPENROUTER_SEED=42))
+    mock_create.return_value = _fake_response()
+
+    result = client.complete(messages=[{"role": "user", "content": "hi"}], temperature=0.7, seed=99)
+
+    assert mock_create.call_args.kwargs["temperature"] == 0.7
+    assert mock_create.call_args.kwargs["seed"] == 99
+    assert result.temperature == 0.7
+    assert result.seed == 99
 
 
 def test_production_routing_uses_configured_provider_order() -> None:
@@ -151,8 +169,7 @@ def test_benchmark_routing_pins_single_provider_and_quantization() -> None:
     client.complete(
         messages=[{"role": "user", "content": "hi"}],
         routing_mode=RoutingMode.BENCHMARK,
-        provider_pin="pinned-vendor",
-        quantizations=["fp16"],
+        routing_policy=RoutingPolicy(provider_pin="pinned-vendor", quantizations=["fp16"]),
     )
 
     provider = mock_create.call_args.kwargs["extra_body"]["provider"]
@@ -161,18 +178,50 @@ def test_benchmark_routing_pins_single_provider_and_quantization() -> None:
     assert provider["quantizations"] == ["fp16"]
 
 
+def test_benchmark_routing_works_without_quantizations() -> None:
+    """Several candidates (Gemini/GPT/Claude on OpenRouter) publish no
+    quantization label at all — benchmark routing must not require one."""
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    client.complete(
+        messages=[{"role": "user", "content": "hi"}],
+        routing_mode=RoutingMode.BENCHMARK,
+        routing_policy=RoutingPolicy(provider_pin="pinned-vendor"),
+    )
+
+    provider = mock_create.call_args.kwargs["extra_body"]["provider"]
+    assert provider["order"] == ["pinned-vendor"]
+    assert provider["allow_fallbacks"] is False
+    assert "quantizations" not in provider
+
+
 def test_benchmark_routing_requires_provider_pin() -> None:
     client, _ = _client_with_mock(_settings())
     with pytest.raises(OpenRouterError, match="provider_pin"):
-        client.complete(messages=[], routing_mode=RoutingMode.BENCHMARK, quantizations=["fp16"])
+        client.complete(messages=[], routing_mode=RoutingMode.BENCHMARK)
 
 
-def test_benchmark_routing_requires_quantizations() -> None:
-    client, _ = _client_with_mock(_settings())
-    with pytest.raises(OpenRouterError, match="quantizations"):
-        client.complete(
-            messages=[], routing_mode=RoutingMode.BENCHMARK, provider_pin="pinned-vendor"
-        )
+def test_routing_policy_overrides_zdr_and_data_collection() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    client.complete(
+        messages=[{"role": "user", "content": "hi"}],
+        routing_mode=RoutingMode.BENCHMARK,
+        routing_policy=RoutingPolicy(
+            provider_pin="pinned-vendor", zdr=False, data_collection="allow"
+        ),
+    )
+
+    provider = mock_create.call_args.kwargs["extra_body"]["provider"]
+    assert provider["zdr"] is False
+    assert provider["data_collection"] == "allow"
+
+
+def test_routing_policy_rejects_invalid_data_collection() -> None:
+    with pytest.raises(OpenRouterError, match="data_collection"):
+        RoutingPolicy(data_collection="nope")
 
 
 def test_retries_on_429_then_succeeds() -> None:
