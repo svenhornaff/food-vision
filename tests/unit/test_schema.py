@@ -21,10 +21,10 @@ def test_schema_requires_observations_field_first(strategy: ObservationStrategy)
     assert next(iter(schema["properties"])) == "observations"
 
 
-def test_schema_s1_s3_require_edible_g() -> None:
+def test_schema_s1_s3_require_mass_g() -> None:
     for strategy in (ObservationStrategy.S1, ObservationStrategy.S3):
         schema = schema_for(strategy).schema
-        assert schema["required"] == ["observations", "edible_g"]
+        assert schema["required"] == ["observations", "mass_g"]
 
 
 def test_schema_s2_requires_dimensions() -> None:
@@ -39,9 +39,9 @@ def test_schema_has_no_confidence_field() -> None:
 
 def test_validate_observation_accepts_valid_s1() -> None:
     result = validate_observation(
-        ObservationStrategy.S1, {"observations": "a ripe banana", "edible_g": 118.4}
+        ObservationStrategy.S1, {"observations": "a ripe banana", "mass_g": 118.4}
     )
-    assert result == {"observations": "a ripe banana", "edible_g": 118.4}
+    assert result == {"observations": "a ripe banana", "mass_g": 118.4}
 
 
 def test_validate_observation_accepts_valid_s2() -> None:
@@ -67,16 +67,16 @@ def test_validate_observation_rejects_extra_field() -> None:
     with pytest.raises(ObservationValidationError, match="Unexpected"):
         validate_observation(
             ObservationStrategy.S1,
-            {"observations": "x", "edible_g": 100.0, "confidence": 0.9},
+            {"observations": "x", "mass_g": 100.0, "confidence": 0.9},
         )
 
 
 @pytest.mark.parametrize("bad_value", [True, "118", None, float("nan"), float("inf"), -1.0])
 def test_validate_observation_rejects_invalid_numeric(bad_value: object) -> None:
     with pytest.raises(ObservationValidationError):
-        validate_observation(ObservationStrategy.S1, {"observations": "x", "edible_g": bad_value})
+        validate_observation(ObservationStrategy.S1, {"observations": "x", "mass_g": bad_value})
 
 
 def test_validate_observation_rejects_non_string_observations() -> None:
     with pytest.raises(ObservationValidationError, match="observations"):
-        validate_observation(ObservationStrategy.S1, {"observations": 7, "edible_g": 100.0})
+        validate_observation(ObservationStrategy.S1, {"observations": 7, "mass_g": 100.0})

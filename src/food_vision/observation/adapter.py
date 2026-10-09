@@ -1,6 +1,6 @@
 """Build one observation request and classify its outcome.
 
-docs/dev/pre-study-web-ui.md §7.3. Thin: all transport/retry/telemetry is
+docs/dev/pre-study.md §4.1. Thin: all transport/retry/telemetry is
 ``proxy.ModelProvider``'s job; this module only knows prompts, schemas,
 and how to turn a :class:`~food_vision.proxy.openrouter.CompletionResult`
 into a classified :class:`Observation`.
@@ -65,10 +65,20 @@ class ObservationConfig:
     the module docstring for what changes when that lands."""
 
     strategy: ObservationStrategy
+    #: Prompt filename prefix (pre-study.md §4.1): ``"fruit"`` for the
+    #: own-photo transfer-check prompts (edible mass, ID-1 card), or
+    #: ``"ecustfd"`` for the lean pre-study's prompts (whole mass, 25mm
+    #: coin). Resolves to ``f"{prompt_set}_{strategy}_v1_en.md"``.
+    prompt_set: str = "fruit"
     #: One prompt-image per view, in order; length must match ``images``
     #: passed to :func:`observe`. ``("primary",)`` or ``("c1", "c2")``.
     views: tuple[str, ...] = ("primary",)
     structured_output_mode: StructuredOutputMode = StructuredOutputMode.JSON_SCHEMA
+    #: Forwarded to ``provider.complete()`` as-is; ``None`` lets the
+    #: provider/model default apply. The lean pre-study fixes this at
+    #: 2048 (§3) so a reasoning model exhausting its budget is visible
+    #: as ``truncated`` rather than silently retried with more tokens.
+    max_tokens: int | None = None
     #: Disabled in protocol arms (§4.2); exploratory configs may enable
     #: one repair round once M2's executor implements it. Not implemented
     #: here — ``observe()`` rejects ``repair=True`.
@@ -141,13 +151,14 @@ def observe(
         model=routing.model,
         routing_mode=routing.mode,
         routing_policy=routing.policy,
+        max_tokens=config.max_tokens,
     )
 
     return _classify(config, completion)
 
 
 def _render_prompt(config: ObservationConfig) -> str:
-    text = _load_prompt_text(config.strategy)
+    text = _load_prompt_text(config.prompt_set, config.strategy)
     if config.strategy is not ObservationStrategy.S3:
         return text
     if config.prior_low_g is None or config.prior_high_g is None:
@@ -155,22 +166,23 @@ def _render_prompt(config: ObservationConfig) -> str:
     return text.format(prior_low_g=config.prior_low_g, prior_high_g=config.prior_high_g)
 
 
-_PROMPT_FILENAMES: dict[ObservationStrategy, str] = {
-    ObservationStrategy.S1: "fruit_s1_v1_en.md",
-    ObservationStrategy.S2: "fruit_s2_v1_en.md",
-    ObservationStrategy.S3: "fruit_s3_v1_en.md",
-}
+def _load_prompt_text(prompt_set: str, strategy: ObservationStrategy) -> str:
+    """Load ``{prompt_set}_{strategy}_v1_en.md`` as package data.
 
-
-def _load_prompt_text(strategy: ObservationStrategy) -> str:
+    Raises:
+        FileNotFoundError: no prompt file exists for this
+            ``(prompt_set, strategy)`` pair (e.g. ``prompt_set="ecustfd"``
+            with ``strategy=S2``, which pre-study.md §3 explicitly drops).
+    """
     from importlib import resources
 
-    filename = _PROMPT_FILENAMES[strategy]
-    return (
-        resources.files("food_vision.observation.prompts")
-        .joinpath(filename)
-        .read_text(encoding="utf-8")
-    )
+    filename = f"{prompt_set}_{strategy.value.lower()}_v1_en.md"
+    resource = resources.files("food_vision.observation.prompts").joinpath(filename)
+    if not resource.is_file():
+        raise FileNotFoundError(
+            f"No prompt file {filename!r} for prompt_set={prompt_set!r}, strategy={strategy!r}."
+        )
+    return resource.read_text(encoding="utf-8")
 
 
 def _build_message(prompt_text: str, images: list[bytes]) -> dict[str, Any]:

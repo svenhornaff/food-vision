@@ -13,6 +13,8 @@ dependencies = [
   "pillow>=11,<12",
   "pillow-heif>=0.18",
   "numpy>=2.0",
+  "huggingface-hub>=2.2.0",
+  "matplotlib>=3.11.2",
 ]
 
 [dependency-groups]

@@ -64,9 +64,63 @@ def _routing(model: str = "vendor/model-a") -> Routing:
     return Routing(model=model, mode=RoutingMode.PRODUCTION)
 
 
+class TestPromptSetAndMaxTokens:
+    def test_default_prompt_set_is_fruit(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1)
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        text = received["messages"][0]["content"][0]["text"]
+        assert "edible" in text
+
+    def test_ecustfd_prompt_set_selects_whole_mass_prompt(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1, prompt_set="ecustfd")
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        text = received["messages"][0]["content"][0]["text"]
+        assert "whole" in text
+        assert "coin" in text
+
+    def test_ecustfd_s2_prompt_missing_raises_file_not_found(self) -> None:
+        """pre-study.md §3: S2 is dropped for ECUSTFD (no length/diameter
+        ground truth) — there is deliberately no ecustfd_s2_*.md file."""
+        provider = _FakeProvider(_completion())
+        config = ObservationConfig(strategy=ObservationStrategy.S2, prompt_set="ecustfd")
+
+        with pytest.raises(FileNotFoundError, match="ecustfd"):
+            observe(provider, images=[b"img"], config=config, routing=_routing())
+
+    def test_max_tokens_forwarded_to_provider(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1, max_tokens=2048)
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        assert received["max_tokens"] == 2048
+
+    def test_max_tokens_none_by_default(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1)
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        assert received["max_tokens"] is None
+
+
 class TestMessageShape:
     def test_one_user_message_with_prompt_then_images_in_view_order(self) -> None:
-        provider = _FakeProvider(_completion(parsed={"observations": "x", "edible_g": 100.0}))
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
         images = [b"c1-bytes", b"c2-bytes"]
         config = ObservationConfig(strategy=ObservationStrategy.S1, views=("c1", "c2"))
 
@@ -109,7 +163,7 @@ class TestMessageShape:
 
 class TestModeSelection:
     def test_json_schema_mode_sends_strict_schema(self) -> None:
-        provider = _FakeProvider(_completion(parsed={"observations": "x", "edible_g": 50.0}))
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 50.0}))
         config = ObservationConfig(
             strategy=ObservationStrategy.S1,
             structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
@@ -123,7 +177,7 @@ class TestModeSelection:
 
     def test_json_object_mode_parses_content_manually(self) -> None:
         provider = _FakeProvider(
-            _completion(content='{"observations": "x", "edible_g": 50.0}', parsed=None)
+            _completion(content='{"observations": "x", "mass_g": 50.0}', parsed=None)
         )
         config = ObservationConfig(
             strategy=ObservationStrategy.S1,
@@ -133,7 +187,7 @@ class TestModeSelection:
         result = observe(provider, images=[b"img"], config=config, routing=_routing())
 
         assert result.outcome == ObservationOutcome.OK
-        assert result.values == {"observations": "x", "edible_g": 50.0}
+        assert result.values == {"observations": "x", "mass_g": 50.0}
 
     def test_s3_requires_prior_bounds(self) -> None:
         provider = _FakeProvider(_completion())
@@ -143,7 +197,7 @@ class TestModeSelection:
             observe(provider, images=[b"img"], config=config, routing=_routing())
 
     def test_s3_formats_prior_into_prompt(self) -> None:
-        provider = _FakeProvider(_completion(parsed={"observations": "x", "edible_g": 50.0}))
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 50.0}))
         config = ObservationConfig(
             strategy=ObservationStrategy.S3, prior_low_g=90.0, prior_high_g=140.0
         )
@@ -159,13 +213,13 @@ class TestModeSelection:
 
 class TestOutcomeClassification:
     def test_ok_outcome_for_valid_response(self) -> None:
-        provider = _FakeProvider(_completion(parsed={"observations": "x", "edible_g": 100.0}))
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
         config = ObservationConfig(strategy=ObservationStrategy.S1)
 
         result = observe(provider, images=[b"img"], config=config, routing=_routing())
 
         assert result.outcome == ObservationOutcome.OK
-        assert result.values == {"observations": "x", "edible_g": 100.0}
+        assert result.values == {"observations": "x", "mass_g": 100.0}
         assert result.error is None
 
     def test_invalid_outcome_for_unparseable_content(self) -> None:
@@ -188,7 +242,7 @@ class TestOutcomeClassification:
         assert result.outcome == ObservationOutcome.INVALID
 
     def test_invalid_outcome_for_schema_violation(self) -> None:
-        provider = _FakeProvider(_completion(parsed={"observations": "x", "edible_g": -5.0}))
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": -5.0}))
         config = ObservationConfig(strategy=ObservationStrategy.S1)
 
         result = observe(provider, images=[b"img"], config=config, routing=_routing())

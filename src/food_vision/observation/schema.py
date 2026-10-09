@@ -1,11 +1,16 @@
-"""Strict output schemas, one per strategy (docs/dev/pre-study-web-ui.md §4.2/§4.3).
+"""Strict output schemas, one per strategy (docs/dev/pre-study.md §4.1).
 
-S1/S3 ask for ``edible_g`` directly; S2 asks for ``length_cm`` and
-``max_diameter_cm`` (the calculator does the rest). Every schema puts an
-``observations`` free-text field *before* the numeric answer — in-schema
-chain-of-thought without spending reasoning tokens (§4.2's fixed-factor
-table: "observations field before the answer"). No confidence field (same
-table: "no confidence field").
+S1/S3 ask for ``mass_g`` directly (the prompt text, not this schema,
+defines *which* mass — edible for the own-photo ``fruit_*`` prompts,
+whole-fruit for the ``ecustfd_*`` prompts, since ECUSTFD has no edible-mass
+ground truth); S2 asks for ``length_cm`` and ``max_diameter_cm`` (the
+calculator does the rest). Every schema puts an ``observations`` free-text
+field *before* the numeric answer — in-schema chain-of-thought without
+spending reasoning tokens. No confidence field.
+
+Renamed from ``edible_g`` (pre-study.md §4.1): the lean pre-study runs on
+ECUSTFD, which only has whole-fruit weight, so a field named ``edible_g``
+would misdescribe what's actually being asked for and measured there.
 """
 
 from __future__ import annotations
@@ -26,11 +31,11 @@ __all__ = [
 
 
 class ObservationStrategy(StrEnum):
-    """Which fields the model is asked for (concept §4.3)."""
+    """Which fields the model is asked for (pre-study.md §3)."""
 
-    S1 = "S1"  # direct edible_g estimate
-    S2 = "S2"  # length_cm + max_diameter_cm; calculator derives edible_g
-    S3 = "S3"  # direct edible_g estimate, prompt states a dev-derived prior
+    S1 = "S1"  # direct mass_g estimate
+    S2 = "S2"  # length_cm + max_diameter_cm; calculator derives mass
+    S3 = "S3"  # direct mass_g estimate, prompt states a dev-derived prior
 
 
 class StructuredOutputMode(StrEnum):
@@ -49,12 +54,12 @@ class ObservationValidationError(ValueError):
 
 
 _GRAM_FIELDS: dict[ObservationStrategy, tuple[str, ...]] = {
-    ObservationStrategy.S1: ("observations", "edible_g"),
-    ObservationStrategy.S3: ("observations", "edible_g"),
+    ObservationStrategy.S1: ("observations", "mass_g"),
+    ObservationStrategy.S3: ("observations", "mass_g"),
     ObservationStrategy.S2: ("observations", "length_cm", "max_diameter_cm"),
 }
 
-_NUMERIC_FIELDS = frozenset({"edible_g", "length_cm", "max_diameter_cm"})
+_NUMERIC_FIELDS = frozenset({"mass_g", "length_cm", "max_diameter_cm"})
 
 
 def schema_for(strategy: ObservationStrategy) -> JsonSchemaFormat:

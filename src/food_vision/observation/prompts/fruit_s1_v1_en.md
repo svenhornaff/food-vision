@@ -15,7 +15,7 @@ estimate.
 First, in the `observations` field, briefly describe what you see: the
 fruit type, its apparent size relative to the reference card (if visible),
 and anything unusual about the specimen (bruising, unusual shape, etc.).
-Then give your best single-number estimate in `edible_g`.
+Then give your best single-number estimate in `mass_g`.
 
 Give one specific number, not a range. Do not mention calories, labels or
 nutrition facts — only the physical estimate is requested.

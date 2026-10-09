@@ -20,7 +20,7 @@ down from the typical range if it looks larger or smaller than average.
 First, in the `observations` field, briefly describe what you see: the
 fruit type, its apparent size relative to the reference card (if visible)
 and relative to a typical specimen, and anything unusual about the
-specimen. Then give your best single-number estimate in `edible_g`.
+specimen. Then give your best single-number estimate in `mass_g`.
 
 Give one specific number, not a range. Do not mention calories, labels or
 nutrition facts — only the physical estimate is requested.
