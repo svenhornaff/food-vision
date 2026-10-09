@@ -146,12 +146,12 @@ food-vision/
 └── docs/
     └── dev/
         ├── food-vision-concept.md
-        ├── pre-study-web-ui.md    # implementation spec for the current phase (Phase P / M1–M6)
-        ├── pre-study-implementation.md  # superseded by the above; kept for history
+        ├── pre-study.md    # implementation spec for the current phase (Phase P / M1, L1–L4)
+        ├── archive/pre-study-full-spec.md  # superseded hybrid CLI+web UI design; kept for history
         └── boilerplate.md        # this file
 ```
 
-**Built so far: M1 only** (docs/dev/pre-study-web-ui.md §10 milestones).
+**Built so far: M1 only** (docs/dev/pre-study.md §10 milestones).
 M1's exit criterion — "`observe()` returns a classified `Observation` from
 a recorded fixture" — is met: `domain/calculator.py`, `imaging/`,
 `observation/` all exist, are fully unit-tested with no network I/O, and
@@ -160,12 +160,12 @@ a recorded fixture" — is met: `domain/calculator.py`, `imaging/`,
 `reasoning_text`/`reasoning_tokens`, `cached_tokens`, `raw`, plus `top_p`/
 `max_tokens`/`reasoning` on `complete()`).
 
-**Not built yet** (M2–M6, same doc): `prestudy/` (db, dataset, fits,
-configs, protocols, sweeps, executor, analysis, charts, report, web UI),
-`cli.py`. Also still deferred to Phase 0+ (concept §13): `api/`,
-`enrichment/`, `matching/`, `reference/`, `pipeline/`. Adding any of these
-before there's a reason to is the "over-engineering before evidence" risk
-the concept doc calls out in §15.
+**Not built yet** (L1–L4, same doc): `prestudy/` (`ecustfd.py`, `run.py`,
+`analysis.py`, `report.py`, `__main__.py`) — lean, script-sized, no
+database, no web UI, no `typer`. Also still deferred to Phase 0+ (concept
+§13): `api/`, `enrichment/`, `matching/`, `reference/`, `pipeline/`. Adding
+any of these before there's a reason to is the "over-engineering before
+evidence" risk the concept doc calls out in §15.
 
 ---
 
@@ -216,7 +216,7 @@ Notes:
   `-p logging` back on for just that module via `@pytest.mark.parametrize`
   or a dedicated `pytest.ini` marker — don't remove the global flag without
   re-checking `tests/unit/test_log_factory.py`.
-- `--cov-fail-under=85` is pre-study-web-ui.md §9's floor for
+- `--cov-fail-under=85` is pre-study.md §9's floor for
   `prestudy/`/`observation/`/`imaging/`/`domain/`; actual coverage is
   currently ~98% (one global floor, not split per package —
   `pytest-cov` doesn't make a per-path floor convenient, and the whole
@@ -283,7 +283,7 @@ as the etf-portfolio boilerplate doc's own table):**
 - All OpenRouter tests are mocked at `OpenRouterClient._client`; all
   `observation.adapter.observe()` tests use a fake `ModelProvider` — no
   network I/O, no real API key required to run the suite, matching
-  pre-study-web-ui.md §9's "no live network calls" rule.
+  pre-study.md §9's "no live network calls" rule.
 - Minimum bar covered today: settings import-safety + allowlist
   validation, logging idempotency/no-filesystem-side-effects, the proxy's
   request-building/routing-mode/retry/backoff/telemetry behavior
@@ -352,7 +352,7 @@ nothing about meal observation, prompts, or schemas (that's
   `CompletionResult` carries `generation_id`, `model_resolved`,
   `system_fingerprint`, `native_finish_reason`, `reasoning_text`/
   `reasoning_tokens`, `cached_tokens` and the full `raw` response dict
-  (pre-study-web-ui.md §7.4) — all extracted defensively (`getattr(...,
+  (pre-study.md §7.4) — all extracted defensively (`getattr(...,
   None)`) so minimal/mocked responses never raise, and all default to
   `None`/`{}` so existing callers that construct a bare `CompletionResult`
   don't break.
@@ -389,23 +389,24 @@ table for the reasoning on the first three).
 [x] tests/unit/: settings, logging, proxy — no network I/O
 [x] .gitignore + .env.example + this boilerplate doc
 [x] Makefile: build-env/format/lint/test/clean/ci
-[x] M1 (pre-study-web-ui.md §10): proxy/openrouter.py §7.4 telemetry
+[x] M1 (pre-study.md §10): proxy/openrouter.py §7.4 telemetry
     extension, domain/calculator.py, imaging/ (preprocess + covariates),
     observation/ (schema + prompts + adapter) — 98% coverage, no network I/O
-[ ] M2: prestudy/{db,dataset,fits,configs,protocols,sweeps,executor}.py,
-    cli.py — dev sweep of 1 model x S1 runs, is killed, resumes, completes
-    within budget
-[ ] M3: capture fruit-v1 (144 images; can run in parallel from day 1)
-[ ] M4: smoke, dev exploration, prompt iteration, fits
-[ ] M5: prestudy/{analysis,charts,report}.py, prestudy/web/ — analyze
-    reproduces fixtures; probe + attempt review usable
-[ ] M6: protocol freeze → test sweep → analyze → decision.md
+[ ] L1: prestudy/ecustfd.py + `prepare` — prints counts per
+    type/split/view; object-grouping key verified; writes
+    bench/runs/prestudy-lean/split.csv
+[ ] L2: prestudy/run.py (+ models.toml) — dry run + dev smoke; every
+    candidate returns `ok` on 5 dev images; capability notes recorded
+[ ] L3: full hold-out run (+ stability subset) — results.jsonl complete,
+    cost within budget
+[ ] L4: prestudy/analysis.py, prestudy/report.py, transfer check —
+    report.md, scatter.png, decision.md written
 [ ] reference/ (BLS 4.0 + FDC + OFF → reference.db) — Phase 0 (concept §14)
 [ ] api/ (FastAPI routes) — Phase 1
 [ ] enrichment/, matching/ — Phase 1
 ```
 
 Each unchecked item is either a pre-study milestone
-(docs/dev/pre-study-web-ui.md §10) or a concept-doc phase (§14) with its
+(docs/dev/pre-study.md §7) or a concept-doc phase (§14) with its
 own exit criteria — don't pull one forward without the evidence/dependency
 that milestone/phase calls for.

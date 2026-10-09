@@ -490,11 +490,16 @@ Conventions: `ruff` with `N` (pep8-naming), `E`, `W`, `F`, `I`, `B`, `UP`; line 
 
 ## 14. Delivery Roadmap
 
-### Phase P — Pre-study: model selection (M1–M6 in the spec; photo session in parallel)
+### Phase P — Pre-study: model selection (M1 done; L1–L4 in the spec)
 
-Appendix A; implementation spec in `docs/dev/pre-study-web-ui.md`. Weighed single-fruit set (144 images), pre-registered protocol, frozen test split, 6–8 candidate models, prior baseline.
+Appendix A; implementation spec in `docs/dev/pre-study.md`. ECUSTFD lean
+pre-study (public weighed dataset, ~350 hold-out images, 6 candidate
+models, S1/S3) plus a small own-photo transfer check.
 
-**Exit:** default and fallback model chosen on test-set evidence; decision whether "dimensions → formula" beats "direct grams".
+**Exit:** default and fallback model chosen on hold-out evidence; decision
+whether the prior-stated strategy (S3) beats direct estimation (S1); the
+transfer check confirms the result holds on the pre-study's actual own-photo
+deployment conditions.
 
 ### Phase 0 — Feasibility (1–2 days)
 
@@ -600,73 +605,21 @@ With a single whole fruit, recognition is trivial and nutrient density is a know
 
 **Trap:** a model scores acceptable MAPE by always answering "a medium banana is ~120 g". Specimens must span small → large per type, and the key metric is whether predictions track true weight.
 
-### A.2 Reference set `fruit-v1`
+### A.2–A.7 Implementation
 
-| Dimension | Values |
-|---|---|
-| Fruit types | banana, apple, orange, pear, kiwi, mandarin |
-| Specimens per type | 8, from smallest to largest available |
-| Capture conditions | C1 top-down with reference card · C2 ~45° with card · C3 ~45° no reference |
-| Total | 6 × 8 × 3 = **144 images** (~3 h incl. shopping and weighing) |
+Full spec in `docs/dev/pre-study.md` (lean version, on the public ECUSTFD
+dataset rather than a self-captured `fruit-v1` set): dataset, object
+grouping and dev/hold-out split (ECUSTFD, not `fruit-v1`), strategies S1
+and S3 (S2 dropped — ECUSTFD has no length/diameter ground truth),
+metrics and decision rule, and a small own-photo transfer check that
+replaces `fruit-v1` capture as the sanity check against the model's
+actual deployment conditions.
 
-Optional later levels: **L2** counted items (3 apples, grapes), **L3** cut items (half apple, sliced banana in a bowl). No mixed plates in the pre-study.
-
-**Capture protocol.** Same phone, same neutral board, daylight, no zoom, 30–40 cm. Reference: any ID-1 card (85.60 × 53.98 mm), flat, fully visible, blank side up. No cropping; originals kept.
-
-**Ground truth per specimen.** `whole_g`, `waste_g` (peel/core weighed after cutting), `edible_g = whole_g − waste_g` (BLS is per edible portion); `length_cm`, `max_diameter_cm` (banana: outer curve + mid diameter); `kcal_ref = edible_g × BLS kcal/100 g` with BLS code. Scale resolution ≤ 1 g.
-
-### A.3 Dev / test split
-
-- Split **by specimen**, never by image.
-- dev: 3 specimens per type (size ranks 2, 5, 7; 54 images) for prompt iteration, formula fitting, priors and the B0 baseline.
-- test: 5 specimens per type (ranks 1, 3, 4, 6, 8; 30 specimens, 90 images), **frozen**, run once under a pre-registered protocol.
-- Version the set; any change creates `fruit-v2`.
-
-### A.4 Strategies
-
-| ID | Prompt strategy | Calculation |
-|---|---|---|
-| S1 | "Estimate edible grams" | direct |
-| S2 | "Measure length and max diameter in cm using the card as scale" | per-type formula fitted on dev (banana `a × L × D²`; round fruit ellipsoid × density × edible ratio) |
-| S3 | S1 plus the dev-derived class prior in the prompt | direct; tests the Vinod et al. finding |
-| B0 | no model: dev-set mean edible weight per type | — |
-| B1 | S2 formula on true tape measurements | ceiling for S2 |
-
-### A.5 Candidates and run protocol
-
-- 6–8 models via OpenRouter: 2–3 frontier, 2 economical, 2 open-weight (Qwen3-VL as open baseline). Capability smoke test (image input, strict schema, ZDR route, seed honouring) before freezing the list.
-- Pinned provider, `allow_fallbacks: false`, quantization pinned for open-weight models, temperature 0 (or provider default where 0 is rejected, fixed per arm), strict schema, no output repair.
-- Same normalized image (1024 px). Secondary arms for the top-2 models: 768 px, reasoning off vs default, c1+c2 multi-view.
-- 3 repeats per image; prediction per image = median of valid repeats.
-- Prompts iterated on dev only; protocol frozen (pre-registered, hashed, clean git tree); one test sweep.
-
-### A.6 Metrics and decision rule
-
-Unit of analysis is the **specimen**; all intervals are 95% specimen-cluster bootstrap intervals stratified by fruit type.
-
-| Metric | Definition | Gate |
-|---|---|---|
-| Edible-gram MAPE | specimen level, card conditions (C1+C2), missing predictions imputed with B0 | primary ranking metric |
-| Gain vs B0 | 1 − MAPE / MAPE(B0), paired | ≥ 30% and CI lower bound > 0 |
-| **Size slope β** | log(pred) on log(true) with fruit-type fixed effects | β in [0.7, 1.3], CI lower bound > 0.3 |
-| Geometric bias | exp(mean log(pred/true)) − 1 | within ±10% |
-| Repeatability | median within-image CV across repeats (ICC(2,1) descriptive) | ≤ 5% |
-| Validity | schema-valid on first try, not refused or truncated | ≥ 98% |
-| Reference gain | paired MAPE(C3) − MAPE(C2) | descriptive |
-| Prior effect | paired MAPE(S3) − MAPE(S1), Δβ | descriptive |
-| Bland–Altman (log scale), Lin's CCC, MedAPE | — | descriptive |
-| Latency P50/P95, cost per 1,000 images | provider-reported | tie-breakers |
-
-Among eligible arms, rank by MAPE; arms whose paired difference to the best has a CI containing 0 are tied, and ties go to lower cost, then latency. Per model, S2 or S3 replaces S1 only if its paired ΔMAPE CI is entirely below 0. Fallback is the best eligible arm from a different vendor. If no arm passes the gates, stop and rethink before Phase 0.
-
-### A.7 Deliverables
-
-Implementation spec: `docs/dev/pre-study-web-ui.md` (hybrid CLI + local web UI).
-
-- `bench/sets/fruit-v1/` — `specimens.csv`, `images.csv`, `sessions.csv`, README; images outside git.
-- `bench/protocols/prestudy-v1.toml` — the pre-registration.
-- `food-vision prestudy …` — import, fit, smoke, sweep create/estimate/run/resume, protocol freeze, analyze, serve.
-- `bench/reports/prestudy-v1/` — results JSON, tables, charts, decision.
+The original self-captured `fruit-v1` design (144 images, S1/S2/S3, full
+specimen-cluster-bootstrap protocol) is archived at
+`docs/dev/archive/pre-study-full-spec.md` and is revived only if the
+lean version's transfer check fails, or the pre-study becomes a
+publication.
 
 ### A.8 After the pre-study
 
