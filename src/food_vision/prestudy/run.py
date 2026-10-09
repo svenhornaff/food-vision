@@ -58,10 +58,18 @@ class ModelSpec:
     model: str
     provider_pin: str
     quantizations: tuple[str, ...] = ()
-    #: Recorded by the (not-yet-automated) smoke step; informational only
-    #: here — run_sweep always requests ``temperature=0`` and lets the
-    #: proxy/provider reject or substitute it; nothing here changes that.
+    #: ``False`` when a live smoke test found that *no* OpenRouter endpoint
+    #: for this model lists ``temperature`` in ``supported_parameters``
+    #: (discovered for ``anthropic/claude-sonnet-5`` and ``openai/gpt-5``;
+    #: with ``require_parameters: true``, sending it filters out every
+    #: candidate endpoint regardless of provider pin). ``run_sweep`` then
+    #: omits ``temperature`` from the request entirely rather than sending
+    #: a value the provider will reject the whole request over.
     temperature_zero_ok: bool = True
+    #: Key to send the completion-length cap under. Some GPT-5-family
+    #: endpoints reject ``"max_tokens"`` and require
+    #: ``"max_completion_tokens"`` instead.
+    max_tokens_param: str = "max_tokens"
     notes: str = ""
 
 
@@ -85,6 +93,7 @@ def load_models_toml(path: Path) -> dict[str, ModelSpec]:
             provider_pin=entry["provider_pin"],
             quantizations=tuple(entry.get("quantizations", [])),
             temperature_zero_ok=entry.get("temperature_zero_ok", True),
+            max_tokens_param=entry.get("max_tokens_param", "max_tokens"),
             notes=entry.get("notes", ""),
         )
         specs[spec.model] = spec
@@ -340,8 +349,10 @@ def _run_one(
         prompt_set="ecustfd",
         views=("single",),
         max_tokens=config.max_tokens,
+        max_tokens_param=model_spec.max_tokens_param,
         prior_low_g=prior_low_g,
         prior_high_g=prior_high_g,
+        send_temperature=model_spec.temperature_zero_ok,
     )
     prompt_text = render_prompt(obs_config)
     routing = Routing(

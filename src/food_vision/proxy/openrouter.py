@@ -35,6 +35,10 @@ logger = get_logger(__name__)
 #: HTTP statuses worth retrying per concept §9 ("retry only 429/5xx").
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
+#: Valid keys for the completion-length cap. Some GPT-5-family endpoints
+#: reject "max_tokens" and require "max_completion_tokens" instead.
+_VALID_MAX_TOKENS_PARAMS = frozenset({"max_tokens", "max_completion_tokens"})
+
 
 class RoutingMode(StrEnum):
     """Which OpenRouter ``provider`` routing policy to apply.
@@ -149,8 +153,13 @@ class CompletionResult:
     #: per call (e.g. the pre-study harness) records this alongside the
     #: result instead of having to reconstruct it from inputs.
     effective_routing_policy: dict[str, Any]
-    #: Temperature/seed actually sent, after ``Settings`` fallback.
-    temperature: float
+    #: Temperature actually sent, after ``Settings`` fallback -- ``None``
+    #: when ``send_temperature=False`` omitted it entirely (some next-gen
+    #: reasoning models, e.g. Claude Sonnet 5 / GPT-5 on OpenRouter, don't
+    #: list ``temperature`` in any endpoint's ``supported_parameters`` at
+    #: all; sending it with ``require_parameters: true`` filters out every
+    #: endpoint regardless of provider pin).
+    temperature: float | None
     seed: int | None
     #: Reproducibility/telemetry fields the pre-study harness needs
     #: (docs/dev/pre-study-web-ui.md §7.4). Defensive on extraction: mocked
@@ -188,7 +197,9 @@ class ModelProvider(Protocol):
         seed: int | None = None,
         top_p: float | None = None,
         max_tokens: int | None = None,
+        max_tokens_param: str = "max_tokens",
         reasoning: dict[str, Any] | None = None,
+        send_temperature: bool = True,
     ) -> CompletionResult: ...
 
 
@@ -241,7 +252,9 @@ class OpenRouterClient:
         seed: int | None = None,
         top_p: float | None = None,
         max_tokens: int | None = None,
+        max_tokens_param: str = "max_tokens",
         reasoning: dict[str, Any] | None = None,
+        send_temperature: bool = True,
     ) -> CompletionResult:
         """Run one chat-completion request against OpenRouter.
 
@@ -253,18 +266,36 @@ class OpenRouterClient:
         budget block, forwarded as-is) are only sent when given — most
         callers don't need them.
 
+        ``send_temperature=False`` omits ``temperature`` from the request
+        entirely rather than sending a value — needed for models whose
+        *every* OpenRouter endpoint omits ``temperature`` from
+        ``supported_parameters`` (discovered live for
+        ``anthropic/claude-sonnet-5`` and ``openai/gpt-5``: with
+        ``require_parameters: true``, sending an unsupported param filters
+        out every candidate endpoint regardless of provider pin, raising a
+        404 with no provider available). ``max_tokens_param`` lets a caller
+        send the cap under a different key (e.g. ``"max_completion_tokens"``
+        for some GPT-5-family endpoints) instead of ``"max_tokens"``.
+
         Raises:
             OpenRouterError: model not on the allowlist, benchmark routing
-                missing its required provider pin, or the request failed
-                (non-retryable status, or retries exhausted).
+                missing its required provider pin, ``max_tokens_param`` is
+                not one of ``"max_tokens"``/``"max_completion_tokens"``, or
+                the request failed (non-retryable status, or retries
+                exhausted).
         """
         model_id = self._resolve_model(model)
         policy = routing_policy or RoutingPolicy()
         provider_payload = self._build_provider_payload(routing_mode, policy)
-        effective_temperature = (
+        effective_temperature: float | None = (
             temperature if temperature is not None else self._settings.OPENROUTER_TEMPERATURE
         )
         effective_seed = seed if seed is not None else self._settings.OPENROUTER_SEED
+        if max_tokens_param not in _VALID_MAX_TOKENS_PARAMS:
+            raise OpenRouterError(
+                f"max_tokens_param must be one of {sorted(_VALID_MAX_TOKENS_PARAMS)}, "
+                f"got {max_tokens_param!r}."
+            )
 
         extra_body: dict[str, Any] = {"provider": provider_payload, "usage": {"include": True}}
         if reasoning is not None:
@@ -273,7 +304,6 @@ class OpenRouterClient:
         request_kwargs: dict[str, Any] = {
             "model": model_id,
             "messages": list(messages),
-            "temperature": effective_temperature,
             # ``usage.include`` asks OpenRouter to report actual provider
             # cost on this response; without it ``usage.cost`` is absent on
             # most requests and every row would be flagged
@@ -282,12 +312,16 @@ class OpenRouterClient:
             # *reported*, not estimated, cost possible at all).
             "extra_body": extra_body,
         }
+        if send_temperature:
+            request_kwargs["temperature"] = effective_temperature
+        else:
+            effective_temperature = None
         if effective_seed is not None:
             request_kwargs["seed"] = effective_seed
         if top_p is not None:
             request_kwargs["top_p"] = top_p
         if max_tokens is not None:
-            request_kwargs["max_tokens"] = max_tokens
+            request_kwargs[max_tokens_param] = max_tokens
         if response_format is not None:
             request_kwargs["response_format"] = response_format.as_response_format()
 

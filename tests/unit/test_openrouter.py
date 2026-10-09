@@ -350,6 +350,70 @@ def test_top_p_max_tokens_reasoning_forwarded_when_given() -> None:
     assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
 
 
+def test_send_temperature_false_omits_temperature_and_telemetry_is_none() -> None:
+    """Models whose every OpenRouter endpoint omits ``temperature`` from
+    ``supported_parameters`` (e.g. anthropic/claude-sonnet-5, openai/gpt-5)
+    need it left out of the request entirely, not sent as a value."""
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    result = client.complete(
+        messages=[{"role": "user", "content": "hi"}],
+        send_temperature=False,
+    )
+
+    kwargs = mock_create.call_args.kwargs
+    assert "temperature" not in kwargs
+    assert result.temperature is None
+
+
+def test_send_temperature_true_is_default_and_unaffected() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    result = client.complete(messages=[{"role": "user", "content": "hi"}])
+
+    assert mock_create.call_args.kwargs["temperature"] == 0.0
+    assert result.temperature == 0.0
+
+
+def test_max_tokens_param_overrides_request_key() -> None:
+    """Some GPT-5-family endpoints reject "max_tokens" and require
+    "max_completion_tokens" instead."""
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    client.complete(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=1024,
+        max_tokens_param="max_completion_tokens",
+    )
+
+    kwargs = mock_create.call_args.kwargs
+    assert kwargs["max_completion_tokens"] == 1024
+    assert "max_tokens" not in kwargs
+
+
+def test_max_tokens_param_default_is_max_tokens() -> None:
+    client, mock_create = _client_with_mock(_settings())
+    mock_create.return_value = _fake_response()
+
+    client.complete(messages=[{"role": "user", "content": "hi"}], max_tokens=1024)
+
+    assert mock_create.call_args.kwargs["max_tokens"] == 1024
+
+
+def test_max_tokens_param_rejects_unknown_key() -> None:
+    client, _ = _client_with_mock(_settings())
+
+    with pytest.raises(OpenRouterError, match="max_tokens_param"):
+        client.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1024,
+            max_tokens_param="bogus_param",
+        )
+
+
 def test_json_object_format_sent_as_response_format() -> None:
     client, mock_create = _client_with_mock(_settings())
     mock_create.return_value = _fake_response(content='{"foo": 1}')

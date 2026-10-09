@@ -117,6 +117,51 @@ class TestPromptSetAndMaxTokens:
         assert received is not None
         assert received["max_tokens"] is None
 
+    def test_send_temperature_defaults_true(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1)
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        assert received["send_temperature"] is True
+
+    def test_send_temperature_false_forwarded_to_provider(self) -> None:
+        """Models whose OpenRouter endpoints don't support ``temperature``
+        at all (e.g. anthropic/claude-sonnet-5, openai/gpt-5) need it
+        forwarded from config -> provider.complete() unchanged."""
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1, send_temperature=False)
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        assert received["send_temperature"] is False
+
+    def test_max_tokens_param_default_is_max_tokens(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(strategy=ObservationStrategy.S1)
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        assert received["max_tokens_param"] == "max_tokens"
+
+    def test_max_tokens_param_forwarded_to_provider(self) -> None:
+        provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
+        config = ObservationConfig(
+            strategy=ObservationStrategy.S1, max_tokens_param="max_completion_tokens"
+        )
+
+        observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        received = provider.received_kwargs
+        assert received is not None
+        assert received["max_tokens_param"] == "max_completion_tokens"
+
 
 class TestMessageShape:
     def test_one_user_message_with_prompt_then_images_in_view_order(self) -> None:

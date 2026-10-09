@@ -103,8 +103,18 @@ def _write_images(snapshot_dir: Path, items: tuple[Item, ...]) -> None:
         (images_dir / item.image_path).write_bytes(_jpeg_bytes(color))
 
 
-def _model_spec(model: str = "vendor/model-a") -> ModelSpec:
-    return ModelSpec(model=model, provider_pin="vendor-provider")
+def _model_spec(
+    model: str = "vendor/model-a",
+    *,
+    temperature_zero_ok: bool = True,
+    max_tokens_param: str = "max_tokens",
+) -> ModelSpec:
+    return ModelSpec(
+        model=model,
+        provider_pin="vendor-provider",
+        temperature_zero_ok=temperature_zero_ok,
+        max_tokens_param=max_tokens_param,
+    )
 
 
 class TestBuildKey:
@@ -229,6 +239,27 @@ class TestLoadModelsToml:
         assert specs["vendor/model-a"].provider_pin == "vendor-provider"
         assert specs["vendor/model-a"].quantizations == ("fp8",)
         assert specs["vendor/model-a"].notes == "smoke ok"
+        assert specs["vendor/model-a"].temperature_zero_ok is True
+        assert specs["vendor/model-a"].max_tokens_param == "max_tokens"
+
+    def test_loads_temperature_zero_ok_false_and_max_tokens_param(self, tmp_path: Path) -> None:
+        """anthropic/claude-sonnet-5 and openai/gpt-5 need these set --
+        see bench/runs/prestudy-lean/models.toml for the live finding."""
+        path = tmp_path / "models.toml"
+        path.write_text(
+            """
+            [[models]]
+            model = "openai/gpt-5"
+            provider_pin = "azure"
+            temperature_zero_ok = false
+            max_tokens_param = "max_completion_tokens"
+            """
+        )
+
+        specs = load_models_toml(path)
+
+        assert specs["openai/gpt-5"].temperature_zero_ok is False
+        assert specs["openai/gpt-5"].max_tokens_param == "max_completion_tokens"
 
     def test_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
@@ -272,6 +303,27 @@ class TestRunSweep:
         first = json.loads(lines[0])
         assert first["outcome"] == "ok"
         assert first["pred_g"] == 150.0
+
+    def test_model_spec_temperature_and_max_tokens_param_reach_provider(
+        self, tmp_path: Path
+    ) -> None:
+        """anthropic/claude-sonnet-5 / openai/gpt-5 fix: ModelSpec's
+        temperature_zero_ok=False and a non-default max_tokens_param must
+        flow through ObservationConfig into the provider.complete() call,
+        not just sit unused in models.toml."""
+        items = _items(n_objects=1)
+        model_spec = _model_spec(
+            temperature_zero_ok=False, max_tokens_param="max_completion_tokens"
+        )
+        config = self._base_config(tmp_path, items, models=(model_spec,))
+        provider = _FakeProvider()
+
+        run_sweep(provider, config)
+
+        assert provider.calls is not None and len(provider.calls) > 0
+        for call in provider.calls:
+            assert call["send_temperature"] is False
+            assert call["max_tokens_param"] == "max_completion_tokens"
 
     def test_resume_skips_existing_keys(self, tmp_path: Path) -> None:
         items = _items(n_objects=2)

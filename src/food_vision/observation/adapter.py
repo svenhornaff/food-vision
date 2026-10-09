@@ -88,6 +88,14 @@ class ObservationConfig:
     #: dev-derived prior stated in the prompt, §4.3). ``None`` for S1/S2.
     prior_low_g: float | None = None
     prior_high_g: float | None = None
+    #: Forwarded as-is to ``provider.complete()``. ``send_temperature=False``
+    #: and a non-default ``max_tokens_param`` exist for models whose
+    #: OpenRouter endpoints don't support ``temperature``/``max_tokens``
+    #: under their usual names (discovered live for
+    #: ``anthropic/claude-sonnet-5`` and ``openai/gpt-5`` — see
+    #: ``proxy.openrouter.OpenRouterClient.complete``'s docstring).
+    send_temperature: bool = True
+    max_tokens_param: str = "max_tokens"
 
 
 @dataclass(frozen=True)
@@ -153,6 +161,8 @@ def observe(
         routing_mode=routing.mode,
         routing_policy=routing.policy,
         max_tokens=config.max_tokens,
+        max_tokens_param=config.max_tokens_param,
+        send_temperature=config.send_temperature,
     )
 
     return _classify(config, completion)
