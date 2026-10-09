@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Virtual environments
+.venv
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs (none written by default; reserved for future opt-in file logging)
+logs/
+
+# macOS
+.DS_Store
+
+# Editor / local tool config (personal, not project-standard)
+.vscode/
+.pi/
