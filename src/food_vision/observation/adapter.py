@@ -44,6 +44,7 @@ __all__ = [
     "ObservationOutcome",
     "Observation",
     "observe",
+    "render_prompt",
 ]
 
 
@@ -136,7 +137,7 @@ def observe(
     if config.repair:
         raise ValueError("config.repair=True is not implemented by observation.adapter.observe().")
 
-    prompt_text = _render_prompt(config)
+    prompt_text = render_prompt(config)
     message = _build_message(prompt_text, images)
 
     response_format: JsonObjectFormat | Any
@@ -157,7 +158,18 @@ def observe(
     return _classify(config, completion)
 
 
-def _render_prompt(config: ObservationConfig) -> str:
+def render_prompt(config: ObservationConfig) -> str:
+    """The exact prompt text :func:`observe` will send for ``config``.
+
+    Public so callers that need the prompt's hash for provenance (e.g.
+    ``prestudy.run``'s ``prompt_sha256`` field) don't have to duplicate
+    prompt-loading/S3-prior-formatting logic.
+
+    Raises:
+        ValueError: strategy ``S3`` without both prior bounds set.
+        FileNotFoundError: no prompt file for ``(config.prompt_set,
+            config.strategy)``.
+    """
     text = _load_prompt_text(config.prompt_set, config.strategy)
     if config.strategy is not ObservationStrategy.S3:
         return text
