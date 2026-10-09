@@ -10,12 +10,21 @@ instead of a `food-vision bench` CLI command, because the actual need is
 persisted, queryable evidence and publication-quality charts, not just a
 one-off batch sweep.
 
-This revision folds in a pre-implementation review (see §12) that found
-several gaps between what `OpenRouterClient` could actually do and what
-this plan assumed it could do, plus validity risks specific to running a
-benchmark through an interactive UI instead of a frozen CLI sweep. Fixes
-are called out inline where they change a decision already made, and
-summarized in §12.
+This revision folds in two review passes:
+
+1. A pre-implementation review against the actual `OpenRouterClient`
+   implementation (fixes applied directly to `proxy/openrouter.py`; see
+   §12 for the log).
+2. An external methodology/engineering review (scored 6.5/10: research
+   validity 8, reproducibility 5, data model 6, engineering 6,
+   proportionality 5) arguing the plan stores *what was asked for, not
+   what was returned*, is missing a parent "sweep" object above
+   `run_batches`, under-specifies the independent variables worth
+   controlling, and should be checked against Inspect AI before more
+   custom engineering goes in. That check happened (§13) and the decision
+   was to **keep the custom build** and absorb the review's missing
+   fields (§7, §8, §9) rather than adopt an external harness — recorded
+   here so the trade-off isn't silently lost.
 
 ## 1. Why the interface changed
 
@@ -50,8 +59,11 @@ shape makes it tempting to reach for more:
   the README; do not add CORS/auth scaffolding that implies otherwise.
 - No durable job queue (Celery/RQ/etc.) — FastAPI `BackgroundTasks` is
   enough at this volume and concurrency (one researcher, one process).
-- No SQLAlchemy/SQLModel — stdlib `sqlite3` is enough at ~3–4k rows; an
-  ORM would be a dependency with no payoff here.
+- No SQLAlchemy/SQLModel — stdlib `sqlite3` is enough even at the larger
+  row counts this revision implies (§7); an ORM would be a dependency
+  with no payoff here.
+- No adoption of Inspect AI / promptfoo as the execution engine — evaluated
+  in §13, decision was to keep this system self-contained.
 
 ## 3. Namespace: kept out of the future production `api/`
 
@@ -79,30 +91,35 @@ src/food_vision/
 │   ├── schema.py                # strict JSON schema per strategy (S1/S2/S3)
 │   ├── adapter.py                # builds multimodal message, calls OpenRouterClient
 │   └── prompts/
-│       ├── observe_fruit_s1.md
-│       ├── observe_fruit_s2.md
-│       └── observe_fruit_s3.md
+│       ├── observe_fruit_s1_v1_en.md
+│       ├── observe_fruit_s2_v1_en.md
+│       ├── observe_fruit_s3_v1_en.md
+│       └── ...                   # one file per (strategy, version, language) — §7.4
 ├── domain/
 │   ├── __init__.py
 │   └── calculator.py              # pure S2 formulas, kcal_from_edible_g
 ├── imaging/
 │   ├── __init__.py
-│   └── preprocess.py              # decode, resize/normalize, strip EXIF, re-encode
+│   ├── preprocess.py              # decode, resize/normalize, strip EXIF, re-encode
+│   └── covariates.py              # extract phone/focal-length/etc. from EXIF BEFORE stripping
 └── bench/
     ├── __init__.py
     ├── db.py                       # sqlite3 connection-per-call helpers, schema, queries
     ├── dataset.py                  # fruit-v1 manifest import -> samples rows
+    ├── sweeps.py                   # NEW: sweep creation, environment snapshot capture
     ├── runs.py                     # batch lifecycle, repeat execution, baselines
     ├── fruit_reference.py          # tiny kcal/density/edible-ratio lookup
     ├── calculator_fits.py          # stores/looks up fitted S2 constants per experiment
-    ├── metrics.py                  # MAPE, Spearman rho+slope, bias, CV, bootstrap CI
+    ├── prior_values.py             # dev-only S3 prior provenance
+    ├── metrics.py                  # MAPE, Spearman, Bland-Altman, ICC, median APE, R^2, CCC, bootstrap CI
     ├── charts.py                   # matplotlib SVG+PNG export from stored history
     └── web/
         ├── __init__.py
         ├── app.py                  # create_app(), lifespan, routes, DI
         ├── templates/
         │   ├── base.html
-        │   ├── new_run.html         # upload + param form
+        │   ├── new_sweep.html        # NEW: define a sweep's fixed env/prompt/schema
+        │   ├── new_run.html         # upload + param form (within a sweep)
         │   ├── batch_status.html    # polling page for a running batch
         │   ├── history.html         # queryable run list/filter + test-split counters
         │   └── charts.html          # chart gallery + download links
@@ -124,10 +141,14 @@ bench/
 
 Notes:
 
-- `var/prestudy/` (not `bench/runs/`) holds mutable runtime state —
-  uploaded images and the SQLite file are not meant to be versioned, so
-  they get their own gitignored root distinct from the data directories
-  that *are* tracked (`bench/sets/`, `data/`).
+- `imaging/covariates.py` is new (external review: phone model, focal
+  length, capture distance, lighting, background, scale device/resolution
+  are "cheap to record now and impossible to reconstruct later"). It runs
+  **before** `preprocess.py` strips EXIF, writes the extracted fields to
+  `samples` (§7.2), and the raw EXIF bytes are never sent to a model and
+  never leave the local DB.
+- `bench/sweeps.py` is new — captures the per-sweep environment snapshot
+  (§7.3) once per sweep, not once per batch.
 - Package data (`observation/prompts/*.md`, `bench/web/templates/*.html`,
   `bench/web/static/*.css`) is included automatically by `uv_build`'s
   default "everything under `src/food_vision/`" packaging — verify with
@@ -143,16 +164,16 @@ dependencies = [
   "uvicorn[standard]>=0.32.0,<1.0.0",
   "python-multipart>=0.0.12",   # multipart/form-data upload parsing
   "jinja2>=3.1.0,<4.0.0",
-  "pillow>=11.0.0,<12.0.0",      # decode/resize/EXIF-strip, decompression-bomb guard
+  "pillow>=11.0.0,<12.0.0",      # decode/resize/EXIF-read-then-strip, decompression-bomb guard
   "matplotlib>=3.9.0,<4.0.0",    # Agg backend, SVG+PNG chart export
 ]
 ```
 
-Deliberately **not** added: SQLAlchemy/SQLModel (stdlib `sqlite3` is
-enough), pandas/scipy/seaborn (metrics in §8.7 are small enough for plain
-`statistics`/hand-rolled Spearman+bootstrap — resolves the open question
-left in the CLI plan), HTMX/any JS framework (plain forms + a few lines of
-polling JS are enough for one local user).
+Deliberately **not** added: SQLAlchemy/SQLModel, pandas/scipy/seaborn (the
+expanded metrics in §9 are still implementable with plain
+`statistics`/hand-rolled rank-correlation, Bland–Altman, and ICC — these
+are closed-form/small-N computations, not a `pandas` justification by
+themselves), HTMX/any JS framework, Inspect AI/promptfoo (§13).
 
 ## 6. Settings additions (additive only, `config/settings.py`)
 
@@ -165,29 +186,44 @@ PRESTUDY_MAX_DECODED_PIXELS: int = 40_000_000            # decompression-bomb gu
 ```
 
 No directories are created at import time or at `Settings()` construction
-— creation happens once, in the app's `lifespan`, consistent with the
-existing "settings/logging have no import-time side effects" rule
-(`config/settings.py` docstring, `utils/log_factory.py`).
+— creation happens once, in the app's `lifespan`.
 
-This plan now also relies on `OpenRouterClient.complete()` accepting
-per-call `temperature`, `seed`, and a `routing_policy: RoutingPolicy`
+This plan relies on `OpenRouterClient.complete()` accepting per-call
+`temperature`, `seed`, and a `routing_policy: RoutingPolicy`
 (`provider_pin` required for `RoutingMode.BENCHMARK`, `quantizations`/
-`zdr`/`data_collection` optional overrides) — **already implemented** in
-`proxy/openrouter.py` as of this revision; no proxy changes remain
-outstanding for this plan to depend on. `CompletionResult` additionally
-carries `effective_routing_policy`, `temperature`, and `seed` so a caller
-can record exactly what was sent, not just what it asked for.
+`zdr`/`data_collection` optional overrides) — **already implemented**.
+This revision adds a further requirement, not yet implemented in
+`proxy/openrouter.py` (listed as outstanding in §12's new row): extending
+`complete()`/`CompletionResult` to accept `top_p`, `max_tokens`, a
+`reasoning` config (`effort: none|minimal|low|medium|high` or a token
+budget, plus `exclude`), and a `structured_output_mode` switch
+(`json_schema`/`tool_call`/`json_object`), and to **surface** on
+`CompletionResult` what OpenRouter actually returned: `model_resolved`,
+`system_fingerprint`, `generation_id`, `native_finish_reason`,
+`reasoning_tokens`, `cached_tokens`, and whether a sent `seed` was
+honoured (OpenRouter sometimes drops it silently — the only way to know
+is to compare what was sent to what the provider's response implies, and
+providers don't uniformly echo this back, so `seed_honoured` will often
+have to be `NULL`/unknown rather than a confident boolean). This is a
+proxy-layer change, out of scope for this doc to implement, but the data
+model in §7 assumes it exists.
 
 ## 7. Data model (SQLite, stdlib `sqlite3`)
 
-Why raw `sqlite3` over SQLAlchemy/SQLModel: at ~3–4k rows total, the
-query surface is small and known up front (insert a batch+attempts,
-update attempt status, filter/aggregate for charts) — parameterized SQL
-plus a `schema_version` table covers it with zero extra dependency
-surface, and keeps the "framework-free utilities" discipline already used
-for logging.
+Why raw `sqlite3` over SQLAlchemy/SQLModel: the query surface (insert a
+sweep/batch/attempts, update attempt status, filter/aggregate for charts)
+is small and known up front even with the expanded column set below —
+parameterized SQL plus a `schema_version` table covers it with zero extra
+dependency surface, and keeps the "framework-free utilities" discipline
+already used for logging. Row-count estimate is revised upward from the
+original ~3–4k: a 54-image × 6-model × 3-repeat sweep alone is ~1,000
+attempts, and several sweeps are expected across the study — still
+trivially within SQLite's comfort zone (it scales to tens of millions of
+rows on a single file), so this doesn't change the SQLite-vs-DB-server
+decision, only confirms a `sweeps` parent object is needed to keep that
+volume navigable (external review's "data model" finding).
 
-### 7.1 Connection handling (fix: no shared connection across threads)
+### 7.1 Connection handling (unchanged: no shared connection across threads)
 
 **Do not** open one `sqlite3.connect()` at startup and store it on
 `app.state`. `sqlite3` connections default to `check_same_thread=True`,
@@ -196,41 +232,12 @@ in a thread-pool thread different from the request thread that opened the
 connection — sharing one connection across that boundary raises
 `sqlite3.ProgrammingError` at the first background-task query.
 
-Instead, `bench/db.py` provides a connection-per-call context manager:
-
-```python
-@contextmanager
-def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(db_path, timeout=5.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-```
-
-- The FastAPI `get_db()` dependency opens one connection per **request**
-  via this context manager (closed when the request finishes).
-- `runs.execute_batch` (running inside `BackgroundTasks`, its own thread)
-  opens its **own** connection via the same context manager — never reuses
-  a connection handed to it from the request that scheduled it.
-- WAL mode is what makes this safe and fast: concurrent readers (the
-  request thread polling batch status) don't block the writer (the
-  background task), and multiple short writer transactions from different
-  connections serialize automatically with `busy_timeout` absorbing brief
-  contention instead of raising `database is locked`.
-- A batch + its N queued `run_attempts` rows are inserted in one
-  transaction, in the **request's** connection, before the background task
-  is scheduled — so "submitted" is immediately visible and queryable even
-  before execution starts. Each attempt's result is then written in its
-  own short transaction, on the **background task's own connection**, as
-  it completes.
+`bench/db.py` provides a connection-per-call context manager (WAL mode,
+`busy_timeout`); the request's `get_db()` dependency and
+`runs.execute_batch`'s background task each open their own connection via
+this helper — never share one. See the original design rationale (still
+valid) in this doc's git history if more detail is needed; unchanged by
+this revision.
 
 ### 7.2 Schema
 
@@ -246,6 +253,17 @@ CREATE TABLE samples (
     split TEXT,                    -- dev/test, NULL for manual_upload
     whole_g REAL, edible_g REAL, length_cm REAL, max_diameter_cm REAL,
     bls_code TEXT, kcal_ref REAL,
+    -- Covariates (external review: "cheap to record now, impossible to
+    -- reconstruct later"). Extracted from EXIF by imaging/covariates.py
+    -- BEFORE imaging/preprocess.py strips EXIF for the outbound request;
+    -- these never leave the local DB.
+    phone_model TEXT,
+    focal_length_mm REAL,
+    capture_distance_cm REAL,       -- manual entry at capture time, not from EXIF
+    lighting TEXT,                   -- controlled vocabulary, e.g. 'daylight'|'indoor_artificial'|'mixed'
+    background TEXT,
+    scale_model TEXT,                -- physical scale used for this sample's ground truth
+    scale_resolution_g REAL,         -- e.g. 1.0, 0.1
     created_at TEXT NOT NULL
 );
 
@@ -257,11 +275,6 @@ CREATE TABLE experiments (
     created_at TEXT NOT NULL
 );
 
--- Fix #6: protocol_compliant must also account for the prompt, not just
--- temperature/resolution/repeats. A test-split batch only counts as
--- protocol-compliant if its prompt_hash was frozen *before* that batch
--- ran. Freezing is an explicit action (e.g. a small CLI/admin route),
--- never implicit from "I ran it on dev enough times".
 CREATE TABLE frozen_prompts (
     id INTEGER PRIMARY KEY,
     strategy TEXT NOT NULL CHECK (strategy IN ('S1','S2','S3')),
@@ -270,10 +283,6 @@ CREATE TABLE frozen_prompts (
     UNIQUE (strategy, prompt_hash)
 );
 
--- Fix #9: fitted S2/B1 constants (banana volume coefficient `a`,
--- per-type density, edible_ratio) are fit data, not code constants —
--- store them keyed by experiment so a batch records exactly which fit it
--- used, and re-fitting doesn't silently change the meaning of old rows.
 CREATE TABLE calculator_fits (
     id INTEGER PRIMARY KEY,
     experiment_id INTEGER NOT NULL REFERENCES experiments(id),
@@ -286,9 +295,6 @@ CREATE TABLE calculator_fits (
     UNIQUE (experiment_id, fruit_type, param_name)
 );
 
--- Fix #8: S3's typical-portion prior (p10/p50/p90 per fruit type) must be
--- derived from dev specimens (or an external table), never from test
--- specimens, and the exact values used must be traceable per experiment.
 CREATE TABLE prior_values (
     id INTEGER PRIMARY KEY,
     experiment_id INTEGER NOT NULL REFERENCES experiments(id),
@@ -299,31 +305,75 @@ CREATE TABLE prior_values (
     UNIQUE (experiment_id, fruit_type)
 );
 
+-- NEW (external review "data model" finding #1): the parent object a
+-- batch of batches belongs to. One sweep = one launch sharing the same
+-- code version, prompt text, schema version, and settings snapshot —
+-- e.g. "54 images x 6 models x 3 repeats" is one sweep containing ~324
+-- batches, not 324 unrelated rows with no common anchor. This is also
+-- where the ISERN-guideline-style "exact model version and run date,
+-- full config" requirement gets satisfied: one row per sweep, not
+-- reconstructed after the fact from scattered batch columns.
+CREATE TABLE sweeps (
+    id INTEGER PRIMARY KEY,
+    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+    name TEXT NOT NULL,
+    git_sha TEXT NOT NULL,
+    git_dirty INTEGER NOT NULL,
+    food_vision_version TEXT NOT NULL,
+    openai_sdk_version TEXT NOT NULL,
+    pillow_version TEXT NOT NULL,
+    prompt_text TEXT NOT NULL,        -- full snapshot, not only a hash
+    prompt_hash TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    schema_hash TEXT NOT NULL,
+    settings_snapshot TEXT NOT NULL,  -- JSON, secrets stripped (no API keys)
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE run_batches (
     id INTEGER PRIMARY KEY,
+    sweep_id INTEGER REFERENCES sweeps(id),       -- NULL only for pre-sweep ad-hoc exploration
     experiment_id INTEGER REFERENCES experiments(id),
-    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    -- Fix (external review "data model" finding #2, multi-view support):
+    -- a batch no longer points at exactly one sample. `primary_sample_id`
+    -- is the specimen whose ground truth this batch is scored against;
+    -- `batch_images` (below) lists every image actually attached to the
+    -- request, so a `views='c1_c2'` batch has two rows there (both
+    -- conditions of the same specimen) while a single-view batch has one.
+    primary_sample_id INTEGER NOT NULL REFERENCES samples(id),
     strategy TEXT NOT NULL CHECK (strategy IN ('S1','S2','S3','B0','B1')),
     model TEXT,                     -- NULL for B0/B1 (no provider call)
-    -- Fix #4: the full effective RoutingPolicy (provider_pin REQUIRED for
-    -- S1/S2/S3; quantizations OPTIONAL — several candidates, e.g. Gemini/
-    -- GPT/Claude on OpenRouter, carry no quantization label at all, so
-    -- requiring one would just exclude them; zdr/data_collection default
-    -- to Settings unless explicitly overridden), stored verbatim from
-    -- CompletionResult.effective_routing_policy so a failing provider/
-    -- privacy-policy combination is one row to inspect, not an env-file
-    -- edit and restart.
     routing_policy TEXT,             -- JSON: {order, allow_fallbacks, quantizations?, zdr, data_collection}
+    -- Generation knobs with a known/suspected confound effect get their
+    -- own column (filterable, chartable); everything else lives in
+    -- generation_config (JSON) to keep the schema stable as more knobs
+    -- get added, same discipline as routing_policy above.
     temperature REAL,
     seed INTEGER,
+    top_p REAL,
+    max_tokens INTEGER,
+    reasoning_effort TEXT CHECK (
+        reasoning_effort IN ('none','minimal','low','medium','high') OR reasoning_effort IS NULL
+    ),
+    structured_output_mode TEXT CHECK (
+        structured_output_mode IN ('json_schema','tool_call','json_object')
+    ),
+    generation_config TEXT,          -- JSON: reasoning_max_tokens, reasoning_exclude, etc.
     resolution_px INTEGER,
-    repeats INTEGER NOT NULL,
+    image_format TEXT CHECK (image_format IN ('JPEG','WEBP','PNG')),
+    image_detail TEXT CHECK (image_detail IN ('low','high','auto') OR image_detail IS NULL),
+    views TEXT NOT NULL DEFAULT 'c1' CHECK (views IN ('c1','c2','c1_c2')),
+    image_config TEXT,               -- JSON: jpeg_quality, etc.
+    prompt_id TEXT,
+    prompt_version INTEGER,
     prompt_hash TEXT,
-    calculator_fit_experiment_id INTEGER REFERENCES experiments(id),  -- which fit set S2/B1 used
-    -- Fix #7: a test-split batch requires this explicit flag, set only
-    -- via a confirmation checkbox in the UI — never a default, never
-    -- inferred from split alone, so burning the frozen set is never one
-    -- accidental click.
+    prompt_config TEXT,              -- JSON: system_vs_user, persona_enabled,
+                                      --       reference_card_stated, prompt_language,
+                                      --       field_order, confidence_field_enabled
+    schema_version TEXT,
+    repeats INTEGER NOT NULL,        -- UI label: "epochs" (Inspect AI's term, per review)
+    calculator_fit_experiment_id INTEGER REFERENCES experiments(id),
+    prior_experiment_id INTEGER REFERENCES experiments(id),  -- S3 prior_source pointer
     is_frozen_run INTEGER NOT NULL DEFAULT 0,
     protocol_compliant INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN
@@ -332,29 +382,59 @@ CREATE TABLE run_batches (
     completed_at TEXT
 );
 
+CREATE TABLE batch_images (
+    batch_id INTEGER NOT NULL REFERENCES run_batches(id),
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    role TEXT NOT NULL CHECK (role IN ('primary', 'secondary')),
+    PRIMARY KEY (batch_id, sample_id)
+);
+
 CREATE TABLE run_attempts (
     id INTEGER PRIMARY KEY,
     batch_id INTEGER NOT NULL REFERENCES run_batches(id),
     repeat_index INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('queued','ok','schema_invalid','error')),
-    raw_response TEXT,               -- JSON text, model's parsed dict or null
+    status TEXT NOT NULL CHECK (status IN ('queued','ok','schema_invalid','error','refused')),
+    raw_response TEXT,               -- full JSON, not just parsed fields — re-parse without re-paying
     edible_g_pred REAL,
     kcal_pred REAL,
     length_cm_pred REAL, max_diameter_cm_pred REAL,   -- S2 only
+    confidence_pred REAL,             -- when confidence_field_enabled
     schema_valid INTEGER,
-    latency_ms REAL,
-    attempts INTEGER,                -- OpenRouterClient's own retry count
+    schema_valid_first_try INTEGER,   -- distinct from schema_valid: did it need a repair pass?
+    repair_attempted INTEGER,
+    parse_error TEXT,
+    refusal INTEGER,
+    -- Reproducibility fields (external review "reproducibility" finding:
+    -- "stores what you asked for, not what you got"). Requires the
+    -- proxy-layer CompletionResult extension noted in §6.
+    model_requested TEXT,
+    model_resolved TEXT,              -- aliases move; group/re-baseline by this + system_fingerprint
+    system_fingerprint TEXT,
+    provider_served TEXT,
+    openrouter_generation_id TEXT,     -- lets native token counts/upstream ID be fetched later
+    finish_reason TEXT,
+    native_finish_reason TEXT,         -- detects truncation/refusals/content filters the normalized field hides
     prompt_tokens INTEGER, completion_tokens INTEGER,
+    reasoning_tokens INTEGER, cached_tokens INTEGER,
     cost_usd REAL, cost_is_estimate INTEGER,
-    provider_used TEXT, model_used TEXT,
+    latency_ms REAL,
+    started_at TEXT, ended_at TEXT,     -- UTC ISO-8601 — correlates drift with provider-side deployments
+    attempts INTEGER,                   -- OpenRouterClient's own retry count
+    request_sha256 TEXT,                -- canonical request minus image bytes — exact replay
+    image_sent_sha256 TEXT,             -- proves which bytes were actually evaluated
+    seed_sent INTEGER,
+    seed_honoured INTEGER,              -- nullable: NULL when the provider gives no way to tell
+    reasoning_text TEXT,                 -- optional, kept separate from raw_response for readability
+    human_reviewed INTEGER NOT NULL DEFAULT 0,  -- ISERN guideline: validate a subset by hand
+    human_review_notes TEXT,
     error TEXT,
     created_at TEXT NOT NULL
 );
 
 CREATE TABLE chart_exports (
     id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,              -- e.g. 'predicted_vs_true', 'mape_by_model'
-    filter_spec TEXT NOT NULL,       -- JSON: experiment, split, strategy, models, exploratory-toggle, etc.
+    kind TEXT NOT NULL,              -- e.g. 'predicted_vs_true', 'bland_altman', 'mape_by_model'
+    filter_spec TEXT NOT NULL,       -- JSON: sweep, experiment, split, strategy, models, exploratory-toggle, etc.
     attempt_ids TEXT NOT NULL,       -- JSON array of run_attempts.id used, frozen at export time
     bootstrap_seed INTEGER,
     svg_path TEXT NOT NULL, png_path TEXT NOT NULL,
@@ -363,387 +443,397 @@ CREATE TABLE chart_exports (
 );
 ```
 
-### 7.3 `protocol_compliant` (fix #6 extends the earlier escalation answer)
+### 7.3 Per-sweep environment snapshot (`bench/sweeps.py`)
 
-Per your earlier decision: **allow any value, flag non-protocol runs.** A
-batch is `protocol_compliant = 1` iff:
+`create_sweep(db, experiment_id, name, prompt_path, schema_version) -> int`
+reads `importlib.metadata.version("food_vision")`,
+`importlib.metadata.version("openai")`,
+`importlib.metadata.version("pillow")`, runs `git rev-parse HEAD` +
+`git status --porcelain` (dirty flag) against the repo root, reads the
+full prompt text at `prompt_path` (and hashes it), computes a schema hash
+from `observation/schema.py`'s current output for that strategy, and
+serializes `get_settings()` with every field whose name contains `KEY`,
+`SECRET`, or `TOKEN` stripped — all inserted as one `sweeps` row before
+any batch under it is created. A sweep is immutable once created (no
+update path); starting a new sweep is the only way to change prompt/code/
+settings mid-study, which is the point — it's what makes "group results
+by fingerprint and re-baseline when it changes" (external review) and
+ISERN's "exact model version and run date, full config" both just a
+`sweeps` row lookup instead of archaeology.
+
+### 7.4 `protocol_compliant`
+
+A batch is `protocol_compliant = 1` iff:
 
 ```text
 temperature == 0
 AND resolution_px IN (1024, 768)
 AND repeats == 3
-AND (sample.split != 'test' OR (strategy IN ('B0','B1')) OR
+AND (primary_sample.split != 'test' OR (strategy IN ('B0','B1')) OR
      EXISTS frozen_prompts WHERE strategy = batch.strategy
                              AND prompt_hash = batch.prompt_hash)
 ```
 
 Computed once at batch creation in `runs.py`, stored (not recomputed ad
-hoc) so chart queries stay simple. Without the prompt clause, a test-split
-run made with a prompt tweaked *after* dev-split iteration would still
-read as protocol-compliant — the one case the earlier check missed,
-because temperature/resolution/repeats were satisfied but the prompt
-itself was never frozen. `metrics.py`'s decision-rule aggregations
-(MAPE/Spearman ρ/slope/bias — the numbers that go in the paper, concept
-§Appendix A.6) filter to `protocol_compliant = 1` **by default**;
+hoc). `metrics.py`'s decision-rule aggregations (MAPE/Spearman ρ/slope/
+bias/Bland–Altman/ICC/median APE/R²/CCC — concept §Appendix A.6 plus §9's
+additions) filter to `protocol_compliant = 1` **by default**;
 `history.html` and `charts.html` both expose an explicit "include
-exploratory runs" toggle that lifts the filter, and every chart export's
-`filter_spec` records whether that toggle was on — so a figure pulled
-into a paper is traceably either protocol-only or mixed, never ambiguous.
+exploratory runs" toggle, and every chart export's `filter_spec` records
+whether that toggle was on.
+
+Unchanged from the prior revision otherwise: the frozen-test-split
+guard (`is_frozen_run`) and per-(model, strategy) test-split counter in
+`history.html` apply exactly as before.
 
 ## 8. Component responsibilities
 
+### 8.0 `imaging/covariates.py` (new)
+
+`extract_covariates(raw_image_bytes) -> SampleCovariates` — reads EXIF via
+Pillow (`Image.getexif()`) **before** `preprocess.normalize_image` strips
+it: camera make/model, focal length (35mm-equivalent where available).
+Capture distance/lighting/background/scale-model/scale-resolution are not
+in EXIF — they're entered once per capture session alongside the
+manifest (`fruit-v1`) or via a small form field for manual uploads, and
+`bench/dataset.py`/the upload route write them onto the `samples` row.
+Pure function on image bytes; no network, no DB — easy to unit test
+against a handful of fixture images with known EXIF.
+
 ### 8.1 `imaging/preprocess.py`
 
-Same contract as the CLI plan's §5.1: `normalize_image(path_or_bytes,
-max_px) -> bytes` — Pillow decode (enforcing `PRESTUDY_MAX_DECODED_PIXELS`
-before full decode to guard decompression bombs), resize longest edge to
-`max_px`, strip EXIF, re-encode JPEG ~q90. Pure function; same unit tests
-as before. Also used for the derived file written to
-`var/prestudy/normalized/`.
+Unchanged contract: `normalize_image(path_or_bytes, max_px, *, image_format='JPEG', jpeg_quality=90) -> bytes`
+— Pillow decode (enforcing `PRESTUDY_MAX_DECODED_PIXELS` before full
+decode), resize longest edge to `max_px`, strip EXIF, re-encode. `format`/
+`jpeg_quality` are now parameters (external review: independent variables
+to make configurable), not hardcoded — called once per image per batch's
+`image_format`/`jpeg_quality`/`resolution_px`.
 
 ### 8.2 `observation/{schema.py,adapter.py,prompts/}`
 
-Per-strategy strict JSON Schema, versioned prompt files loaded as package
-data, a thin wrapper around `OpenRouterClient.complete`:
+Expanded surface vs. the prior revision:
 
 ```python
 def observe(
     client: ModelProvider,
     *,
-    image_bytes: bytes,
+    image_bytes: list[bytes],          # 1 entry for single-view, 2 for views='c1_c2'
     strategy: Strategy,
     model: str,
     routing_mode: RoutingMode,
-    routing_policy: RoutingPolicy,     # provider_pin required; quantizations optional
+    routing_policy: RoutingPolicy,
     temperature: float,
     seed: int | None,
+    top_p: float | None,
+    max_tokens: int | None,
+    reasoning_effort: ReasoningEffort | None,
+    reasoning_config: ReasoningConfig | None,   # max_tokens budget, exclude
+    structured_output_mode: StructuredOutputMode,  # json_schema | tool_call | json_object
+    prompt_id: str,
+    prompt_version: int,
+    prompt_config: PromptConfig,        # system_vs_user, persona_enabled,
+                                         # reference_card_stated, language, field_order,
+                                         # confidence_field_enabled
+    schema_version: str,
 ) -> ObservationResult: ...
 ```
 
-`routing_policy`/`temperature`/`seed` are **passed through from the
-batch's stored params** (`run_batches.routing_policy`/`temperature`/
-`seed`), not re-read from `Settings` here — this is what makes per-batch
-exploration outside the frozen protocol possible at all (fix #1: before
-this revision, `OpenRouterClient.complete()` only read temperature/seed
-from process-wide `Settings`, which made a per-run `temperature` column in
-`run_batches` meaningless; `complete()` now accepts both as optional
-per-call overrides). Called from `bench/runs.py` instead of a CLI command.
+- Prompt files are now named `{strategy}_v{version}_{language}.md`
+  (§4), loaded via `prompt_id`+`prompt_version`+`prompt_config.language`;
+  `prompt_config.field_order='observations_first'` picks a schema/prompt
+  variant that asks for a free-text `observations` field *before*
+  `edible_g` — in-schema chain-of-thought without spending reasoning
+  tokens (external review).
+- `structured_output_mode` selects how the schema is enforced: strict
+  `response_format: json_schema` (current default), an OpenRouter
+  `tools`/function-call shape, or a `json_object` mode where the schema is
+  described in the prompt text only and validated after the fact — not
+  every candidate model supports `json_schema`, and the mode itself can
+  change results, so it has to be a logged variable, not an assumption.
+  **`structured_output_mode` is itself a `run_batches` column** (§7.2),
+  filterable in `history.html`/charts.
+- `views='c1_c2'` attaches both condition images in one message — cheap
+  multi-view condition to test (external review cites Cal AI using this).
+  `observe()` takes `image_bytes: list[bytes]` for this reason even though
+  almost all batches pass a single-element list.
+- A reasoning-exhaustion failure mode is explicitly handled, not silently
+  mis-scored: OpenRouter reasoning tokens count against `max_tokens`; when
+  reasoning consumes the whole budget, the response comes back with
+  `finish_reason: length` and empty `content`. `adapter.observe` detects
+  this (`finish_reason == 'length' and not content`) and returns a
+  distinct `ObservationResult.error = "reasoning_budget_exhausted"` rather
+  than a generic schema-parse failure — this is a capacity/config problem,
+  not a model-capability one, and the two must not be conflated in
+  `schema_valid_rate`.
+- `routing_policy`/`temperature`/`seed`/everything else above is passed
+  through from the batch's stored params, never re-read from `Settings`
+  here — unchanged reasoning from the prior revision, just a longer
+  parameter list now.
 
 ### 8.3 `domain/calculator.py`
 
-Pure S2 formulas, property-tested — unchanged signatures from the CLI
-plan's §5.4, but the constants they're called with now come from
-`bench/calculator_fits.py` (§8.4a) keyed by `experiment_id`, not from
-module-level literals.
+Unchanged: pure S2 formulas, property-tested, called with constants from
+`bench/calculator_fits.py` keyed by `experiment_id`.
 
-### 8.4 `bench/fruit_reference.py`
+### 8.4 `bench/fruit_reference.py` / `bench/calculator_fits.py` / `bench/prior_values.py`
 
-Unchanged from the CLI plan's §5.5 — tiny CSV-backed lookup
-(`kcal_100g`), not a real `reference/` pipeline.
-
-### 8.4a `bench/calculator_fits.py` (new, fix #9)
-
-- `record_fit(db, experiment_id, fruit_type, param_name, value, notes=None) -> None`
-  — inserts/updates a `calculator_fits` row; raises if `fitted_on_split`
-  would be anything other than `'dev'` (the column's `CHECK` constraint is
-  the hard backstop; this function is the only intended writer).
-- `get_fits(db, experiment_id, fruit_type) -> dict[str, float]` — returns
-  `{"banana_a": ..., "density_g_cm3": ..., "edible_ratio": ...}` for the
-  given experiment/type, raising a clear error if a required param is
-  missing rather than silently falling back to a hardcoded guess.
-- `runs.py` passes `get_fits(db, batch.calculator_fit_experiment_id, sample.fruit_type)`
-  into `domain.calculator` for S2/B1 batches. A batch created before any
-  fit has been recorded for its experiment fails fast at creation time
-  with a message pointing at which fit is missing, rather than producing
-  a silently wrong S2/B1 estimate.
-
-### 8.4b `bench/prior_values.py` (new, fix #8)
-
-- `record_priors(db, experiment_id, fruit_type, p10_g, p50_g, p90_g, source) -> None`
-  — `source` must be `'dev_specimens'` (computed from dev-split
-  `samples` rows for that type) or `'external_table'` (e.g. BLS/NVS II
-  portion data copied in by hand); never computed from test-split rows —
-  enforced by the function only ever querying `samples WHERE split =
-  'dev'` when `source='dev_specimens'`.
-- `get_priors(db, experiment_id, fruit_type) -> PriorValues` — read by the
-  S3 prompt-building step in `observation/adapter.py` (via `runs.py`) so
-  the exact p10/p50/p90 used in a given S3 batch is traceable back to one
-  `prior_values` row, not a hardcoded line in a prompt file.
+Unchanged from the prior revision.
 
 ### 8.5 `bench/dataset.py`
 
-New: `import_manifest(path: Path) -> ImportSummary` — reads
-`bench/sets/fruit-v1/manifest.jsonl`, validates each line via a Pydantic
-`ManifestEntry` (same shape as the CLI plan's §4.1), upserts one `samples`
-row per entry keyed on `specimen_id + condition` (re-import is
-idempotent), records the manifest's sha256 on an `experiments` row so a
-chart's provenance can point at an exact dataset version. Run once via a
-small `python -m food_vision.bench.dataset import bench/sets/fruit-v1/manifest.jsonl`
-script (not a web form — this is a one-time data-loading step, not a
-per-run action).
+Unchanged core contract (`import_manifest`), extended to also populate the
+new `samples` covariate columns (§7.2) from manifest fields (if the
+manifest schema is extended to carry them — see §11 open item) or from a
+companion per-specimen metadata file if not.
 
-### 8.6 `bench/runs.py`
+### 8.6 `bench/sweeps.py` (new, see §7.3)
 
-- `create_batch(db, *, sample_id, strategy, model, routing_policy,
-  temperature, seed, resolution_px, repeats, experiment_id,
+`create_sweep(...) -> int` as described in §7.3. Called once per sweep
+from `new_sweep.html` (§8.9), not per batch.
+
+### 8.7 `bench/runs.py`
+
+- `create_batch(db, *, sweep_id, primary_sample_id, secondary_sample_id=None,
+  views, strategy, model, routing_policy, temperature, seed, top_p,
+  max_tokens, reasoning_effort, reasoning_config, structured_output_mode,
+  resolution_px, image_format, jpeg_quality, image_detail, prompt_id,
+  prompt_version, prompt_config, schema_version, repeats,
+  experiment_id, calculator_fit_experiment_id=None, prior_experiment_id=None,
   is_frozen_run=False) -> int`:
-  - Validates `model` against `FOOD_VISION_MODELS` via `get_settings()`.
-  - For S1/S2/S3: `routing_policy.provider_pin` is **required**;
-    `routing_policy.quantizations` is **optional** (fix #3 — previously
-    both were required, which made benchmark routing unusable for
-    candidates that don't publish a quantization label at all).
-  - For B0/B1: no provider call is made, so `model`/`routing_policy` are
-    ignored if supplied (and the UI doesn't show those fields for these
-    strategies).
-  - For S2/B1: resolves `calculator_fit_experiment_id` (defaults to
-    `experiment_id` unless the caller points at a different experiment's
-    fit set) and calls `calculator_fits.get_fits` eagerly — fails fast
-    here, not mid-run, if the fit is missing.
-  - For S3: resolves and validates a `prior_values` row exists for the
-    sample's `fruit_type` under `experiment_id` — same fail-fast reasoning.
-  - **Fix #7**: if `sample.split == 'test'` and `is_frozen_run` is not
-    explicitly `True`, raises `ValueError` — the web form only sets this
-    from an explicit, unchecked-by-default "I confirm this is a frozen
-    test-split run" checkbox (§8.9); there is no default path that spends
-    a test-split sample.
-  - Computes `protocol_compliant` per §7.3 (including the frozen-prompt
-    check), inserts the batch + N queued `run_attempts` rows in one
-    transaction, returns `batch_id`.
-- `execute_batch(db_path, client, batch_id) -> None` — the function passed
-  to FastAPI's `BackgroundTasks`; opens its **own** `bench.db.connect()`
-  connection (§7.1 — never reuses the request's connection). Loads the
-  batch + sample, loops repeats:
-  - B0: dev-split per-type mean from `samples` (no provider call).
-  - B1: `domain.calculator` (with `calculator_fits.get_fits`) on the
-    sample's **true** `length_cm`/`max_diameter_cm` (no provider call).
-  - S1/S2/S3: `imaging.preprocess` → `observation.adapter.observe` (passing
-    the batch's `routing_policy`/`temperature`/`seed`) → (S2 only)
-    `domain.calculator` → `bench.fruit_reference` for kcal.
-  - Writes each attempt's result immediately (own short transaction),
-    including `effective_routing_policy` from `CompletionResult` so what
-    was *actually* sent is recorded even if it differs from what was
-    requested (e.g. a provider substitution); on exception, writes
-    `status='error'` with the message and continues to the next repeat
-    rather than aborting the batch.
-  - Marks the batch `completed` (or `failed` if every attempt errored).
-- On app startup (`lifespan`), any batch left `queued`/`running` from a
-  previous process is marked `interrupted` — makes crash/restart state
-  visible instead of silently stuck "running" forever.
+  - All validation from the prior revision still applies (model
+    allowlist, `routing_policy.provider_pin` required for S1–S3 and
+    `quantizations` optional, B0/B1 ignore routing/generation params, S2/
+    B1 require a resolvable `calculator_fits` row, S3 requires a
+    resolvable `prior_values` row, frozen-test-split guard, `prompt_hash`
+    resolved from the sweep's frozen prompt text + `prompt_config`).
+  - `views='c1_c2'` requires `secondary_sample_id` to be a sample with the
+    same `specimen_id` and the complementary condition (`c2` when primary
+    is `c1`); inserts two `batch_images` rows.
+  - `structured_output_mode` defaults to `'json_schema'` but is validated
+    against a small per-model capability table (not every model supports
+    strict JSON Schema) rather than assumed universal.
+  - Computes `protocol_compliant` per §7.4, inserts the batch + N queued
+    `run_attempts` rows in one transaction, returns `batch_id`.
+- `execute_batch(db_path, client, batch_id)` — unchanged connection
+  discipline (§7.1: own connection, never the request's). For each repeat:
+  resolves image(s) via `batch_images`, builds the request via
+  `observation.adapter.observe` with the full parameter set above, and
+  writes every reproducibility field in §7.2's `run_attempts` columns from
+  the (proxy-layer-extended, §6) `CompletionResult`: `model_resolved`,
+  `system_fingerprint`, `openrouter_generation_id`, `native_finish_reason`,
+  `reasoning_tokens`, `cached_tokens`, `request_sha256`/
+  `image_sent_sha256` (computed here, not by the proxy — the proxy
+  shouldn't need to know about canonicalization rules), `started_at`/
+  `ended_at` (UTC, bracketing the call). A `reasoning_budget_exhausted`
+  result is written with `status='error'`, `parse_error` set to that
+  string, and is excluded from `schema_valid_rate` denominators (it's not
+  a parse attempt at all).
+- Startup `interrupted`-marking: unchanged from the prior revision.
 
-### 8.7 `bench/metrics.py`
+### 8.8 `bench/metrics.py`
 
-Same functions as the CLI plan's §5.7 (`mape`, `spearman_rho_and_slope`,
-`signed_bias`, `repeat_cv`, `schema_valid_rate`, `bootstrap_ci`), reading
-from `run_attempts`/`samples` via `bench/db.py` queries. Implemented with
-plain `statistics` + a small hand-rolled rank-correlation and percentile
-bootstrap (no `pandas`/`scipy`). All decision-rule aggregations default to
-`protocol_compliant = 1` rows only (§7.3), with an explicit parameter to
-include exploratory rows when the caller (a chart function, or
-`history.html`) asks for it.
+Existing functions (`mape`, `spearman_rho_and_slope`, `signed_bias`,
+`repeat_cv`, `schema_valid_rate`, `bootstrap_ci`) plus, per the external
+review's "metrics to add":
 
-### 8.8 `bench/charts.py`
+- `bland_altman(predicted, true) -> BlandAltmanResult` — mean bias, SD of
+  differences, 95% limits of agreement (`bias ± 1.96·SD`).
+- `icc(repeated_predictions_by_group) -> float` — intraclass correlation
+  across repeats (two-way random, agreement form — the variant used in
+  the cited 2026 GPT-5.2/Gemini-3-Flash/Claude-Sonnet-4.6 weighed-meals
+  study), computed as a one-way ANOVA-based ICC(1) to stay inside plain
+  `statistics` rather than pulling in `pingouin`/`statsmodels`.
+- `median_ape(predicted, true) -> float` — more robust to outlier
+  specimens than mean MAPE; reported alongside it, not instead of it.
+- `r_squared(predicted, true) -> float`.
+- `lins_ccc(predicted, true) -> float` — Lin's concordance correlation
+  coefficient, combines precision (Pearson r) and accuracy (bias from the
+  45° line) into one number; complements Spearman ρ (rank-only) and the
+  Bland–Altman bias/LoA (additive-bias-focused).
 
-- One function per chart kind, each: runs a parameterized query against
-  `bench/db.py` for the given `filter_spec`, builds the plot with
-  `matplotlib` (`matplotlib.use("Agg")` set once at module import — no
-  display backend needed), saves both `.svg` and 600-DPI `.png` to
-  `bench/reports/prestudy-web/charts/chart-{id}-{kind}.{ext}`, inserts a
-  `chart_exports` row recording the exact `attempt_ids` used, the
-  `filter_spec` (including the exploratory-runs toggle state), and file
-  hashes — so a chart is **immutable** once exported (re-running the same
-  filter later creates a new `chart_exports` row/id rather than
-  overwriting, since new runs may have been added since).
-- Chart kinds: `predicted_vs_true` (scatter, y=x line, per model/strategy,
-  colored by fruit type), `mape_by_model` (bar + bootstrap CI,
-  protocol-only by default), `latency_distribution` (box/violin per
-  model), `cost_per_1000` (bar per model), `repeat_cv_by_model` (bar),
-  `condition_effect` (grouped bar, C2 vs C3 MAPE per model),
-  `schema_valid_rate` (bar), `signed_bias_by_type` (grouped bar/heatmap).
-- **Methodology caveat to render on `latency_distribution`/resolution-
-  comparison charts** (hygiene item, see §12): providers apply their own
-  image tiling before inference (e.g. Gemini tiles around 768px, OpenAI
-  around 512px tiles), so the 768-vs-1024px comparison this study runs
-  (concept §A.5) is partly confounded by provider-side resizing that
-  happens regardless of what we upload. Keep the comparison — it's still
-  informative about end-to-end behavior — but the chart/report must say
-  so explicitly rather than presenting it as a clean controlled variable.
+All of the above take an explicit `protocol_compliant_only: bool = True`
+filter argument, same discipline as the existing metrics.
 
-### 8.9 `bench/web/app.py`
+### 8.9 `bench/charts.py`
 
-- `create_app() -> FastAPI` factory (not a module-level singleton — keeps
-  it testable with per-test temp DB/dirs).
-- `lifespan`: calls `configure_logging()`, `get_settings()`, creates
-  `PRESTUDY_UPLOAD_DIR`/`PRESTUDY_NORMALIZED_DIR`/DB parent dir if
-  missing, runs schema migration/version check (opening and closing its
-  own short-lived connection via `bench.db.connect()` — **not** one held
-  on `app.state`, per §7.1), marks stale `queued`/`running` batches
-  `interrupted`, and stores only the `db_path` and a
-  `get_default_provider()`-built `OpenRouterClient` on `app.state` (both
-  stateless/reusable across threads; the connection itself never is).
-- Routes under `/prestudy`:
-  - `GET /prestudy/` → `new_run.html` (upload form + param form; model
-    `<select>` populated from `FOOD_VISION_MODELS`; provider-pin is a
-    required text field, quantization an optional one — fix #3; split is
-    read from the selected sample, and if it's `'test'` the form renders
-    an unchecked "I confirm this is a frozen test-split run" checkbox
-    that must be ticked to submit — fix #7).
-  - `POST /prestudy/samples` → multipart upload, validates
-    content-type/size, decodes via `imaging.preprocess` (rejecting
-    decompression bombs before full decode), stores raw+normalized files
-    under content-hashed names (never the user's filename), inserts a
-    `samples` row with `source='manual_upload'`, redirects to the param
-    form for that sample.
-  - `POST /prestudy/batches` → validates params via `runs.create_batch`
-    (which itself enforces the frozen-run checkbox and fit/prior
-    prerequisites), schedules `runs.execute_batch` as a `BackgroundTasks`
-    job, redirects to `batch_status.html?batch_id=...`.
-  - `GET /prestudy/batches/{id}` → status + attempts so far (HTML; a
-    small inline `fetch`-poll every ~2s re-renders until `status` is
-    terminal — no JS framework).
-  - `GET /prestudy/history` → `history.html`, filterable table over
-    `run_batches`/`run_attempts` (by experiment, split, strategy, model,
-    protocol-compliance), **plus a counter of test-split batches per
-    (model, strategy)** (fix #7 — makes "did I already burn the test set
-    for this model/strategy" auditable at a glance instead of having to
-    scroll history), with a link to generate a chart from the current
-    filter.
-  - `GET /prestudy/charts` + `POST /prestudy/charts` → `charts.html`
-    gallery of past `chart_exports` + a form to generate a new one from a
-    `history.html` filter; served images are static files under
-    `bench/reports/prestudy-web/charts/`.
-- Dependencies injected via `Depends`: `get_db()` (opens a fresh
-  connection per request, §7.1), `get_provider()` (overridden with a fake
-  in tests), `get_settings()` (already lazy/cached).
+Existing chart kinds unchanged, plus:
 
-## 9. Testing plan
+- `bland_altman_plot` (difference vs. mean, bias line, LoA band, per
+  model/strategy) — a standard figure type in the domain literature cited
+  by the review (Cureus 2026, Nakagawa & Yamamoto 2026, ACETADA); directly
+  reusable in a paper.
+- `calibration_plot` — when `confidence_field_enabled`, predicted
+  confidence vs. empirical accuracy, binned; "nearly free" per the review
+  since `confidence_pred` is already a stored column.
+- `reasoning_effort_tradeoff` — cost/latency/MAPE vs. `reasoning_effort`,
+  the parameter the review flags as "mov[ing] cost, latency and probably
+  accuracy more than temperature does."
+
+Resolution-comparison charts keep the existing provider-side-tiling
+caveat (Gemini ~768px tiles, OpenAI ~512px tiles confound the 768-vs-1024
+comparison) — unchanged from the prior revision.
+
+### 8.10 `bench/web/app.py`
+
+New `new_sweep.html` form (git SHA/dirty flag and package versions are
+read automatically, not entered by hand; the researcher picks experiment,
+prompt file + version, schema version, and names the sweep) feeding
+`bench/sweeps.py`, sitting in front of the existing `new_run.html` (which
+now also exposes the expanded parameter set: `top_p`, `max_tokens`,
+reasoning effort/budget/exclude, `structured_output_mode`, image
+format/quality/detail, `views`, prompt placement/persona/reference-card-
+stated/language/field-order/confidence-field toggles — grouped into
+collapsible sections in the template so the common path, S1/S2/S3 with
+mostly-default params, isn't buried). Connection handling (§7.1),
+frozen-run checkbox (§7.4), and history/chart routes are otherwise
+unchanged from the prior revision.
+
+## 9. Open-model baseline and contamination (external review)
+
+Per the ISERN LLM-study guidelines cited in the review (exact model
+version + run date, full config, exact prompts, **an open-model
+baseline**, **a contamination check**, human validation of a subset):
+
+- **Open-model baseline**: add an open-weights candidate to the model
+  list (the review names Qwen3-VL as the general candidate and Food-R1 —
+  a food-specialized Qwen3-VL-8B with published Nutrition5k numbers — as
+  a food-specific one). No code/schema change: it's just another `model`
+  value on OpenRouter (or a self-hosted endpoint behind the same
+  `ModelProvider` Protocol, if not available on OpenRouter) going through
+  the same batch/attempt pipeline. Tracked as an open item (§11) because
+  model-candidate selection is an operational decision made when the
+  sweep runs, consistent with how the rest of this doc treats the
+  candidate list.
+- **Contamination**: `fruit-v1`'s own photos sidestep training-set
+  contamination by construction (they're not a published benchmark like
+  Nutrition5k) — worth stating explicitly in the eventual report rather
+  than leaving it implicit.
+- **Human validation of a subset**: `run_attempts.human_reviewed`/
+  `human_review_notes` (§7.2) exist so a researcher can mark a sampled
+  subset of attempts as manually checked against the image — a workflow
+  note (check a stratified sample after each sweep), not a feature to
+  build; `history.html`'s filter can select `human_reviewed = 0` rows to
+  sample from.
+
+## 10. Testing plan
 
 All against a temp SQLite file per test (`tmp_path`), FastAPI
-`TestClient`, and a fake `ModelProvider` (the existing `Protocol` in
-`proxy/openrouter.py`) — **no live OpenRouter calls**, consistent with the
-existing test suite.
+`TestClient`, and a fake `ModelProvider` — **no live OpenRouter calls**.
 
 - `tests/unit/test_bench_db.py` — schema creation/versioning, insert/query
-  round-trips for each table, WAL/foreign-key pragmas applied, **a
-  connection opened on one thread and used from another does not raise**
-  (regression test for fix #5 — simulates the request/background-task
-  split directly).
-- `tests/unit/test_bench_dataset.py` — manifest import idempotency,
-  invalid-entry rejection, experiment manifest-hash recorded.
-- `tests/unit/test_bench_calculator_fits.py` — `record_fit`/`get_fits`
-  round-trip; `get_fits` raises a clear error when a required param is
-  missing; rejects a non-`'dev'` `fitted_on_split`.
-- `tests/unit/test_bench_prior_values.py` — `record_priors` with
-  `source='dev_specimens'` only ever reads `samples WHERE split='dev'`
-  (assert via a fixture with both dev and test rows for the same type);
-  `get_priors` round-trip.
-- `tests/unit/test_bench_runs.py` — `create_batch` validation: rejects
-  unknown model; requires `routing_policy.provider_pin` for S1–S3 but
-  **accepts a missing `quantizations`** (regression test for fix #3);
-  rejects/ignores routing params for B0/B1; **rejects a test-split batch
-  when `is_frozen_run` is not `True`, accepts it when `True`** (fix #7);
-  fails fast when a required `calculator_fits`/`prior_values` row is
-  missing; `protocol_compliant` computed correctly including the
-  frozen-prompt clause (fix #6: a test-split batch with an *unfrozen*
-  prompt_hash is not compliant even with temp=0/res=1024/repeats=3;
-  becomes compliant once the same `(strategy, prompt_hash)` is inserted
-  into `frozen_prompts`). `execute_batch` with the fake provider: happy
-  path records `effective_routing_policy`/`temperature`/`seed` from
-  `CompletionResult`, schema-invalid response, provider exception
-  (attempt marked `error`, batch continues), B0/B1 make zero
-  fake-provider calls.
-- `tests/unit/test_bench_metrics.py` — MAPE/bias zero on perfect
-  predictions, CV zero on identical repeats, bootstrap CI contains the
-  point estimate, Spearman ρ against a hand-computed fixture,
-  protocol-only filtering excludes non-compliant rows by default.
-- `tests/unit/test_bench_charts.py` — each chart function against fixture
-  DB rows produces a non-empty `.svg` (contains `<svg`) and a valid PNG
-  (correct magic bytes), inserts exactly one `chart_exports` row with the
-  right `attempt_ids`; **no pixel comparison**.
-- `tests/unit/test_prestudy_web.py` — route-level: GET form pages render,
-  including the frozen-run checkbox only appearing for `split='test'`
-  samples; POST upload rejects oversized/wrong-mimetype files and
-  sanitizes filenames; POST batch rejects bad params (422), rejects an
-  unchecked frozen-run attempt on a test sample, and accepts valid ones
-  (batch+attempts rows exist before the response returns); status/history
-  pages reflect DB state including the test-split counter; startup
-  `interrupted`-marking covered by seeding a `running` batch before
-  building the app; a background task and its triggering request use
-  independent DB connections without error (integration-level version of
-  the fix #5 regression test).
-- `imaging/preprocess`, `observation/schema`+`adapter`, `domain/calculator`
-  tests: same as the CLI plan's §8 — unaffected by the interface change,
-  except `observation/adapter` tests now assert `temperature`/`seed`/
-  `routing_policy` are forwarded from the call, not read from `Settings`.
-- `proxy/openrouter.py`'s own tests (already updated in this revision):
-  `RoutingPolicy` optional-quantizations behavior, per-call
-  temperature/seed override, `extra_body.usage.include=True` always sent,
-  `CompletionResult.effective_routing_policy` populated.
-
-## 10. Sequencing
-
-1. `data/fruit_kcal_100g.csv` + `bench/fruit_reference.py` (unblocks
-   everything, no provider dependency).
-2. `imaging/preprocess.py` + tests.
-3. `observation/{schema.py,prompts/*.md,adapter.py}` + tests (mocked
-   `OpenRouterClient`, asserting `temperature`/`seed`/`routing_policy`
-   pass-through).
-4. `domain/calculator.py` + property tests.
-5. `bench/db.py` (connection-per-call helper, schema, queries) + tests,
-   including the cross-thread-connection regression test.
-6. `bench/dataset.py` + manifest import + tests.
-7. `bench/calculator_fits.py` + `bench/prior_values.py` + tests.
-8. `bench/runs.py` (batch lifecycle, baselines, frozen-run gate,
-   frozen-prompt-aware `protocol_compliant`) + tests with fake provider.
-9. `bench/metrics.py` + tests.
-10. `bench/charts.py` + tests (including the resizing-confound caveat
-    text on the relevant chart).
-11. `bench/web/app.py` + templates/static + route tests, including the
-    frozen-run checkbox and test-split counter in the UI.
-12. Settings additions (§6), `pyproject.toml` dependency additions (§5),
-    `.gitignore` entry for `var/`.
-13. Capture `fruit-v1` images + run `bench.dataset import` (can happen any
-    time after step 6).
-14. Dev-split exploration through the UI (prompt iteration, parameter
-    exploration, fitting `calculator_fits`/`prior_values` from dev
-    specimens — flagged non-protocol as appropriate); freeze prompts
-    (insert into `frozen_prompts`); one protocol-compliant, explicitly
-    frozen test-split batch per final candidate model; export the
-    decision-rule charts for the paper from `history.html`'s
-    protocol-only filter.
+  round-trips for every table including the new `sweeps`/`batch_images`,
+  WAL/foreign-key pragmas applied, cross-thread connection regression
+  test (unchanged from the prior revision).
+- `tests/unit/test_bench_sweeps.py` — `create_sweep` captures git SHA/
+  dirty flag/package versions correctly (mocked `subprocess`/
+  `importlib.metadata`), strips secret-like settings keys, is immutable
+  (no update path exists).
+- `tests/unit/test_imaging_covariates.py` — EXIF extraction against
+  fixture images with known/missing EXIF (missing EXIF yields `None`
+  fields, not an exception); confirms the function never touches the
+  network or DB.
+- `tests/unit/test_bench_dataset.py`, `test_bench_calculator_fits.py`,
+  `test_bench_prior_values.py` — unchanged from the prior revision.
+- `tests/unit/test_bench_runs.py` — all prior-revision cases, plus:
+  `views='c1_c2'` requires a matching-specimen secondary sample and
+  inserts two `batch_images` rows; `structured_output_mode` validated
+  against a per-model capability table; `execute_batch` writes every new
+  reproducibility column from a fake `CompletionResult` carrying
+  `model_resolved`/`system_fingerprint`/etc.; a `finish_reason: length`
+  with empty content is recorded as `reasoning_budget_exhausted` and
+  excluded from `schema_valid_rate`, not conflated with a generic parse
+  failure.
+- `tests/unit/test_bench_metrics.py` — existing cases plus: Bland–Altman
+  bias/LoA against a hand-computed fixture, ICC against a known-value
+  fixture (e.g. perfect agreement → ICC ≈ 1, independent noise → ICC ≈ 0),
+  median APE and R² on simple fixtures, Lin's CCC against a published
+  worked example.
+- `tests/unit/test_bench_charts.py` — existing cases plus `bland_altman_plot`/
+  `calibration_plot`/`reasoning_effort_tradeoff` produce valid SVG/PNG
+  output; no pixel comparison.
+- `tests/unit/test_prestudy_web.py` — existing cases plus `new_sweep.html`
+  round-trip (create sweep, then a batch referencing it); the expanded
+  `new_run.html` param form rejects an unsupported
+  `structured_output_mode` for the selected model (422).
 
 ## 11. Open items deferred, not blocking
 
-- Retention/backup policy for `var/prestudy/` (images, DB, raw responses):
-  default is "keep everything, no auto-deletion" since this is a personal
-  research tool with modest data volume; revisit only if storage becomes
-  a real concern.
-- `uv_build` package-data inclusion of `templates/`/`static/`/`prompts/`:
-  expected to work by default (everything under `src/food_vision/` is
-  packaged); verify with a `uv build` dry-run once those files exist
-  rather than pre-emptively configuring `[tool.uv_build]`.
-- Which specific OpenRouter provider slugs/quantization labels exist per
-  candidate model is an operational detail decided when the sweep runs
-  (now that quantizations is optional, there's no structural blocker —
-  just look up what each candidate's OpenRouter provider page offers).
+- Retention/backup policy for `var/prestudy/`: unchanged — keep
+  everything, no auto-deletion.
+- `uv_build` package-data inclusion: unchanged — verify with a dry-run
+  once files exist.
+- Exact OpenRouter provider slugs/quantization labels per candidate: an
+  operational decision made when the sweep runs.
+- **Final candidate model list**, including whether/which open-weights
+  model (Qwen3-VL, Food-R1) is actually reachable (via OpenRouter or a
+  self-hosted endpoint) — decide when assembling the first sweep.
+- Whether `fruit-v1`'s manifest format should be extended with the new
+  `samples` covariate columns directly, or whether those are entered via
+  a separate per-specimen metadata file joined at import time — either
+  works; decide when capturing the dataset, not now.
+- `structured_output_mode`'s per-model capability table (which candidates
+  support strict `json_schema` vs. need `tool_call`/`json_object`) is
+  itself something that has to be discovered empirically per candidate —
+  not assumed, not hardcoded speculatively now.
+- `ICC`'s exact variant (one-way vs. two-way random/mixed, agreement vs.
+  consistency) — this doc picks ICC(1) one-way for simplicity; revisit if
+  the repeat-measurement design turns out to need a different model
+  (e.g. if "model" should be treated as a fixed rather than random
+  factor).
 
-## 12. Pre-implementation review — fixes applied in this revision
+## 12. Pre-implementation review — fixes applied in this revision (log, continued)
 
-A review against the actual `OpenRouterClient` implementation and against
-the validity risks of running a frozen-protocol benchmark through an
-interactive UI found the following, all addressed above:
+Carried forward from the prior revision (already applied in
+`proxy/openrouter.py`): per-call `temperature`/`seed`, `usage.include`
+cost telemetry, optional `quantizations`, `RoutingPolicy`, connection-
+per-task SQLite handling, frozen-prompt-aware `protocol_compliant`,
+frozen-test-split guard, dev-only fit/prior provenance, image-resizing
+confound caveat, and the hygiene items (docstrings, Python version,
+dead ruff config) — see this doc's git history for the full table.
 
-| # | Issue | Fix |
+New from the external methodology/engineering review, applied in this
+revision:
+
+| Area | Finding | Fix |
 |---|---|---|
-| 1 | `complete()` only read temperature/seed from `Settings`; this plan needed per-run values. | Added `temperature`/`seed` params to `complete()`, falling back to `Settings` (`proxy/openrouter.py`). |
-| 2 | Cost telemetry was always flagged as an estimate — OpenRouter only reports real cost when asked. | Added `extra_body.usage.include = True` to every request. |
-| 3 | `quantizations` was mandatory for `RoutingMode.BENCHMARK`, excluding candidates with no quantization label (Gemini, GPT, Claude). | Made `quantizations` optional; only `provider_pin` is required, carried on a new `RoutingPolicy`. |
-| 4 | `zdr`+`deny`+single-pin+no-fallback is a narrow intersection; some candidates will have no matching provider. | `RoutingPolicy` is now a per-call object (`provider_pin`, `quantizations`, `zdr`, `data_collection`); the effective policy is recorded on `run_batches.routing_policy` and `CompletionResult.effective_routing_policy`, so a failing combination is one row to inspect. |
-| 5 | A shared `sqlite3` connection on `app.state` plus `BackgroundTasks` would raise `ProgrammingError` across threads. | Connection-per-request and connection-per-background-task via `bench.db.connect()`, WAL mode, no connection stored on `app.state` (§7.1). |
-| 6 | `protocol_compliant` ignored the prompt; a test-split run with a tweaked prompt would wrongly count as protocol. | Added `frozen_prompts` table; compliance now requires `split != 'test' OR prompt_hash` frozen (§7.3). |
-| 7 | Nothing stopped one click from burning the frozen test split during exploration. | `create_batch` requires an explicit `is_frozen_run=True` for `split='test'`, surfaced as an unchecked-by-default UI checkbox; `history.html` shows a per-(model,strategy) test-split-batch counter. |
-| 8 | S3's prior source ("CSV or hardcoded") risked leaking test-split information or being untraceable. | `prior_values` table, `source` pinned to `'dev_specimens'` or `'external_table'`, recorded per experiment/type. |
-| 9 | Fitted constants (banana `a`, round-fruit densities) were planned as code constants despite being fit on dev data. | `calculator_fits` table keyed by `experiment_id`; `run_batches.calculator_fit_experiment_id` records which fit an S2/B1 batch used. |
-| hygiene | Docstrings/boilerplate carried changelog prose ("the previous version was..."); belongs in commit messages. | Trimmed in `model_provider.py` and `docs/dev/boilerplate.md`. |
-| hygiene | `.python-version` pinned 3.12 while the concept doc said 3.13. | Concept doc's runtime line and ADR-002 updated to Python 3.12 (3.13 acceptable) — one source of truth, matching what's actually pinned. |
-| hygiene | `per-file-ignores = ["S101"]` in `pyproject.toml` was dead config (`S` ruleset not selected). | Removed. |
-| hygiene | Provider-side image resizing (Gemini ~768px tiles, OpenAI ~512px tiles) confounds the 768-vs-1024px resolution comparison. | Comparison kept; `bench/charts.py`'s resolution-related charts/report carry an explicit caveat (§8.8) rather than presenting it as a clean controlled variable. |
+| Reproducibility | Stores what was asked for, not what was returned (no `system_fingerprint`, generation ID, provider served, request hash, reasoning/cached tokens, or exact timestamps). | New `run_attempts` columns (§7.2); requires a `proxy/openrouter.py` `CompletionResult` extension, tracked as outstanding in §6 — **not yet implemented**. |
+| Data model | `run_batches` had one `sample_id` with no parent object; a 54×6 sweep is 324 unrelated-looking rows. | New `sweeps` table (§7.2/§7.3) as the parent; `run_batches.sweep_id`. |
+| Data model (secondary) | No way to express a multi-view (`c1`+`c2` together) batch under a one-sample-per-batch model. | `primary_sample_id`/`batch_images` join table (§7.2), `views` column. |
+| Proportionality | Web layer/chart gallery/history filters risk costing more than the study they serve; mature tools (Inspect AI, promptfoo) already do much of this. | Evaluated Inspect AI directly (§13) — OpenRouter provider, image input, structured output, and epochs all confirmed to exist. Decision: **keep the custom build** and absorb the missing fields instead of adopting it, made explicitly rather than by default. |
+| Independent variables | Generation config (`reasoning` effort/budget, `top_p`, `max_tokens`), `structured_output_mode`, image format/quality/detail, `views`, and prompt-construction knobs (placement, persona, reference-card-stated, language, field order, confidence field) were not configurable/logged at all. | Added as explicit `run_batches` columns or a scoped `*_config` JSON column (§7.2); `observation/adapter.observe`'s signature extended (§8.2). |
+| Engineering | Reasoning-token budget exhaustion (`finish_reason: length`, empty content) would otherwise be mis-scored as a generic schema failure. | Detected explicitly in `adapter.observe`, recorded as `reasoning_budget_exhausted`, excluded from `schema_valid_rate` (§8.2/§8.7). |
+| Metrics | Missing Bland–Altman, ICC, median APE, R², Lin's CCC — all used in the cited 2026 domain studies. | Added to `bench/metrics.py` + corresponding chart kinds (§8.8/§8.9). |
+| Methodology (ISERN) | No open-model baseline, no explicit contamination statement, no human-validation-of-a-subset workflow. | §9 added: Qwen3-VL/Food-R1 as an open-model-candidate open item, contamination statement noted, `human_reviewed` column + sampling workflow. |
+
+## 13. Build-vs-buy: Inspect AI evaluation
+
+The external review's recommendation — "before building the web UI, spend
+half a day checking whether Inspect AI covers the harness" — was checked
+directly rather than assumed either way:
+
+- **Confirmed**: Inspect AI (UK AISI) has an OpenRouter provider
+  (`openrouter/<model>`, with `extra_body` passthrough for
+  `order`/`allow_fallbacks`/`require_parameters`-style routing), accepts
+  image inputs, supports structured output via `GenerateConfig.
+  response_schema`, supports repeated `epochs` with configurable score
+  reduction, ships a log viewer (`inspect view`), and exposes
+  `evals_df()`/`samples_df()`/`messages_df()`/`events_df()` for pandas-
+  based analysis.
+- **Gaps found**: no confirmed built-in capture of `system_fingerprint`;
+  cost tracking is a static price table (`set_model_cost()`), not
+  OpenRouter's live `usage.include`-reported cost — both would need a
+  custom metadata hook even under Inspect. A documented open issue
+  affects Gemini reasoning models via OpenRouter (reasoning-block/thought-
+  signature handling breaks tool calls) — not a direct blocker here since
+  this study doesn't use tool calling, but worth re-checking if
+  `structured_output_mode='tool_call'` is ever used with a Gemini
+  candidate.
+- **UI mismatch**: Inspect's interface is a log viewer over completed
+  eval runs, not an interactive "upload a photo, pick params, click run"
+  browser form — the explicit requirement behind building this web app in
+  the first place.
+- **Decision**: keep the custom FastAPI+SQLite build, absorb the review's
+  missing fields (§7–§9) rather than adopt Inspect AI or promptfoo as the
+  execution engine. Recorded here so this trade-off — more total
+  engineering, but one system fully owned and an interactive UI preserved
+  — isn't silently lost if revisited later.
