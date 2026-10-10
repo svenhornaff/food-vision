@@ -22,7 +22,13 @@ from food_vision.prestudy.analysis import (
     decide,
     load_results,
 )
-from food_vision.prestudy.ecustfd import DEFAULT_TYPES, download, prepare, read_split_csv
+from food_vision.prestudy.ecustfd import (
+    DEFAULT_TYPES,
+    download,
+    prepare,
+    read_split_csv,
+    select_variants,
+)
 from food_vision.prestudy.report import write_decision_md, write_report_md, write_scatter_png
 from food_vision.prestudy.run import RunConfig, load_models_toml, run_sweep
 from food_vision.proxy.model_provider import get_default_provider
@@ -34,6 +40,17 @@ _DEFAULT_SPLIT_CSV = Path("bench/runs/prestudy-lean/split.csv")
 _DEFAULT_RESULTS = Path("bench/runs/prestudy-lean/results.jsonl")
 _DEFAULT_MODELS_TOML = Path("bench/runs/prestudy-lean/models.toml")
 _DEFAULT_REPORT_DIR = Path("bench/reports/prestudy-lean")
+
+
+def _parse_max_variants(value: str) -> int | None:
+    """argparse ``type=`` for ``--max-variants-per-object``: an int, or
+    the literal ``"all"`` for every variant (``None``)."""
+    if value == "all":
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer or 'all', got {value!r}")
+    return parsed
 
 
 def _cmd_prepare(args: argparse.Namespace) -> int:
@@ -57,7 +74,13 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    items = read_split_csv(args.split_csv)
+    items = select_variants(
+        read_split_csv(args.split_csv), max_variants_per_object=args.max_variants_per_object
+    )
+    print(
+        f"selected items: {len(items)} "
+        f"(max_variants_per_object={args.max_variants_per_object or 'all'})"
+    )
     models_by_id = load_models_toml(args.models_toml)
     requested_models = [m.strip() for m in args.models.split(",")]
     missing = [m for m in requested_models if m not in models_by_id]
@@ -158,6 +181,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="run the model sweep (live OpenRouter calls)")
     run_parser.add_argument("--models", required=True, help="comma-separated OpenRouter model ids")
     run_parser.add_argument("--strategies", default="S1,S3")
+    run_parser.add_argument(
+        "--max-variants-per-object",
+        type=_parse_max_variants,
+        default=1,
+        metavar="N|all",
+        help="photo variants per (object, view) to send to the model; 'all' uses every "
+        "variant in split.csv (default 1 reproduces the original single-variant sweeps)",
+    )
     run_parser.add_argument("--split", default="holdout", choices=("dev", "holdout", "all"))
     run_parser.add_argument("--repeats", type=int, default=1)
     run_parser.add_argument("--dry-run", type=int, default=None, metavar="N")

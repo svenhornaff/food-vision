@@ -5,12 +5,18 @@ committed ``split.csv``; everything here is pure/deterministic given
 those two inputs (plus the bootstrap's fixed seed).
 
 **Unit of analysis is the object**, not the image or the attempt: per
-(model, strategy, object), the prediction is the median over that
-object's images (views) and repeats with outcome ``ok``. An object with
-zero ``ok`` attempts gets the B0 (dev-mean-weight-per-type) prediction —
-this is what "penalises unreliable models" (§5) means in code: a model
-that mostly fails still gets scored, just badly, rather than being
-excluded from the comparison.
+(model, strategy, object), the prediction is a two-level median —
+first over each (view, variant) slot's repeats (so one "re-ask the
+same photo" burst collapses to one number before it can outweigh a
+slot with fewer repeats), then over that object's slot-level medians.
+With exactly one variant and one repeat per view (the prior, pre-E3
+behaviour — see ``ecustfd.py``'s "Variants" note), this reduces to the
+same flat median across views as before: each slot has exactly one
+value, so the outer median sees the same numbers either way. An object
+with zero ``ok`` attempts gets the B0 (dev-mean-weight-per-type)
+prediction — this is what "penalises unreliable models" (§5) means in
+code: a model that mostly fails still gets scored, just badly, rather
+than being excluded from the comparison.
 
 **Implementation note not fully specified in §5:** validity (share of
 calls with outcome ``ok``) is computed over *attempted* calls only. An
@@ -79,6 +85,10 @@ class AttemptRecord:
     outcome: str
     cost_usd: float | None
     latency_ms: float
+    #: Defaults to ``1`` for rows written before this field existed (see
+    #: ``run.ResultRecord.variant``'s docstring) — those runs only ever
+    #: used variant 1, so the default is exact, not a guess.
+    variant: int = 1
 
 
 def load_results(path: Path) -> tuple[AttemptRecord, ...]:
@@ -110,6 +120,7 @@ def load_results(path: Path) -> tuple[AttemptRecord, ...]:
                     outcome=raw["outcome"],
                     cost_usd=raw["cost_usd"],
                     latency_ms=raw["latency_ms"],
+                    variant=raw.get("variant", 1),
                 )
             )
     return tuple(records)
@@ -146,15 +157,16 @@ def predictions_per_object(
     holdout_objects: dict[str, tuple[str, float]],  # object_key -> (fruit_type, true_g)
     b0_by_type: dict[str, float],
 ) -> tuple[ObjectPrediction, ...]:
-    """One row per hold-out object: median of this (model, strategy)'s
-    ``ok`` predictions across that object's views/repeats, or the B0
-    fallback if it has none.
+    """One row per hold-out object: a two-level median of this (model,
+    strategy)'s ``ok`` predictions — first within each (view, variant)
+    slot (collapsing repeats), then across the object's slots — or the
+    B0 fallback if it has none at all. See the module docstring.
 
     Raises:
         KeyError: an object has ``ok`` predictions but its fruit type
             has no B0 value (no dev-split items of that type at all).
     """
-    ok_by_object: dict[str, list[float]] = defaultdict(list)
+    ok_by_slot: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for attempt in attempts:
         if (
             attempt.model == model
@@ -164,13 +176,17 @@ def predictions_per_object(
             and attempt.pred_g is not None
             and attempt.object_key in holdout_objects
         ):
-            ok_by_object[attempt.object_key].append(attempt.pred_g)
+            ok_by_slot[(attempt.object_key, attempt.view, attempt.variant)].append(attempt.pred_g)
+
+    slot_medians_by_object: dict[str, list[float]] = defaultdict(list)
+    for (object_key, _view, _variant), preds in ok_by_slot.items():
+        slot_medians_by_object[object_key].append(float(np.median(preds)))
 
     results = []
     for object_key, (fruit_type, true_g) in holdout_objects.items():
-        ok_preds = ok_by_object.get(object_key)
-        if ok_preds:
-            pred_g = float(np.median(ok_preds))
+        slot_medians = slot_medians_by_object.get(object_key)
+        if slot_medians:
+            pred_g = float(np.median(slot_medians))
             had_ok = True
         else:
             pred_g = b0_by_type[fruit_type]
@@ -236,12 +252,16 @@ def validity(attempts: tuple[AttemptRecord, ...], *, model: str, strategy: str) 
 
 
 def repeat_cv(attempts: tuple[AttemptRecord, ...], *, model: str, strategy: str) -> float | None:
-    """Median within-image coefficient of variation across repeats, for
-    whichever (object, view) groups have >= 2 ``ok`` repeats (the
-    stability subset, §3 — only run for the top-2 models). Returns
-    ``None`` if no such group exists (this model/strategy has no
-    repeat-subset data), distinct from a computed ``0.0``."""
-    preds_by_group: dict[tuple[str, str], list[float]] = defaultdict(list)
+    """Median within-image coefficient of variation across *repeats*,
+    for whichever (object, view, variant) groups have >= 2 ``ok``
+    repeats (the stability subset, §3 — only run for the top-2 models).
+    Grouping includes ``variant`` deliberately: this measures model-
+    sampling noise on one fixed image, not photo-to-photo variation —
+    conflating the two would mislabel ordinary variant noise as model
+    instability. Returns ``None`` if no such group exists (this
+    model/strategy has no repeat-subset data), distinct from a computed
+    ``0.0``."""
+    preds_by_group: dict[tuple[str, str, int], list[float]] = defaultdict(list)
     for attempt in attempts:
         if (
             attempt.model == model
@@ -250,7 +270,9 @@ def repeat_cv(attempts: tuple[AttemptRecord, ...], *, model: str, strategy: str)
             and attempt.outcome == "ok"
             and attempt.pred_g is not None
         ):
-            preds_by_group[(attempt.object_key, attempt.view)].append(attempt.pred_g)
+            preds_by_group[(attempt.object_key, attempt.view, attempt.variant)].append(
+                attempt.pred_g
+            )
 
     cvs = [
         float(np.std(preds) / np.mean(preds))

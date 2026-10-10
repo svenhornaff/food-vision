@@ -17,13 +17,22 @@ holds in L1 before anything else." The ``(type, weight_g, volume_mm3)``
 fallback (§2) is implemented and exercised by tests, but has not been
 needed against the real data.
 
-**Implementation choice not spelled out in the spec text:** each
-(object, view) may have 2-34 repeated photos in the raw dataset ("S" and
-"T" each have several numbered variants, e.g. ``apple001S(1).JPG`` through
-``apple001S(8).JPG``). §3 ("View: top, side — run as separate images")
-reads as exactly one image per view per object for the main sweep, not
-every variant, so :func:`load_items` deterministically keeps the
-lowest-numbered variant for each (object, view) and discards the rest.
+**Variants (2026-10-10, revised per external review):** each (object,
+view) may have 2-34 repeated photos in the raw dataset ("S" and "T"
+each have several numbered variants, e.g. ``apple001S(1).JPG`` through
+``apple001S(8).JPG``). :func:`load_items` now keeps *every* variant as
+its own :class:`Item` — ``bench/runs/prestudy-lean/split.csv`` is the
+full dataset manifest, not a pre-selected sweep plan. A *prior* version
+of this module kept only the lowest-numbered variant per (object, view)
+(144 of 1,014 fruit images); an external pre-study review
+(``bench/reports/prestudy-lean/review.md`` §2/§5, "E3") flagged this as
+under-using the dataset and recommended using all variants, median per
+object. :func:`select_variants` is the dataset-enumeration/experiment-
+selection split the review asked for: callers that want the old
+one-variant-per-slot behaviour (e.g. to keep reusing already-paid
+``results.jsonl`` rows unchanged) pass ``max_variants_per_object=1``
+(the CLI's default); a full re-analysis can pass ``None`` for all of
+them.
 """
 
 from __future__ import annotations
@@ -48,6 +57,7 @@ __all__ = [
     "download",
     "verify_object_grouping",
     "load_items",
+    "select_variants",
     "write_split_csv",
     "read_split_csv",
     "prepare",
@@ -189,7 +199,10 @@ def _is_holdout(object_key: str) -> bool:
 
 
 def load_items(snapshot_dir: Path, *, types: frozenset[str] = DEFAULT_TYPES) -> PrepareReport:
-    """Build the dev/hold-out item list from a downloaded snapshot.
+    """Build the full (object, view, variant) item list from a downloaded
+    snapshot — every usable fruit image, not a pre-selected sweep plan
+    (see the module docstring's "Variants" note). Use
+    :func:`select_variants` to cut this down for a specific paid run.
 
     Raises:
         FileNotFoundError: ``portions.csv`` or ``annotations.csv`` is
@@ -207,8 +220,7 @@ def load_items(snapshot_dir: Path, *, types: frozenset[str] = DEFAULT_TYPES) -> 
 
     excluded_multi_object = 0
     unparsed: list[str] = []
-    # (object_key, view) -> (variant, object_id, file_name)
-    best_by_object_view: dict[tuple[str, str], tuple[int, str, str]] = {}
+    items: list[Item] = []
 
     for file_name, rows in by_file.items():
         non_coin = [row for row in rows if row["name"] != "coin"]
@@ -229,32 +241,68 @@ def load_items(snapshot_dir: Path, *, types: frozenset[str] = DEFAULT_TYPES) -> 
         view_letter, variant_text = suffix_match.groups()
         view = _VIEW_BY_LETTER[view_letter.upper()]
         variant = int(variant_text)
-
         object_key = _object_key(portion, grouping)
-        slot = (object_key, view)
-        current_best = best_by_object_view.get(slot)
-        if current_best is None or variant < current_best[0]:
-            best_by_object_view[slot] = (variant, object_id, file_name)
 
-    items = [
-        Item(
-            image_path=Path(file_name),
-            object_key=object_key,
-            fruit_type=portions_by_id[object_id]["type"],
-            view=view,
-            weight_g=float(portions_by_id[object_id]["weight_g"]),
-            split="holdout" if _is_holdout(object_key) else "dev",
-            variant=variant,
+        items.append(
+            Item(
+                image_path=Path(file_name),
+                object_key=object_key,
+                fruit_type=portion["type"],
+                view=view,
+                weight_g=float(portion["weight_g"]),
+                split="holdout" if _is_holdout(object_key) else "dev",
+                variant=variant,
+            )
         )
-        for (object_key, view), (variant, object_id, file_name) in best_by_object_view.items()
-    ]
-    items.sort(key=lambda item: (item.object_key, item.view))
+    items.sort(key=lambda item: (item.object_key, item.view, item.variant))
 
     return PrepareReport(
         items=tuple(items),
         grouping=grouping,
         excluded_multi_object_images=excluded_multi_object,
         unparsed_filenames=tuple(sorted(unparsed)),
+    )
+
+
+def select_variants(
+    items: tuple[Item, ...], *, max_variants_per_object: int | None = 1
+) -> tuple[Item, ...]:
+    """Cut a full (all-variants) item list down to at most
+    ``max_variants_per_object`` variants per (object_key, view) slot —
+    the lowest-numbered variants first.
+
+    This is the dataset-enumeration/experiment-selection split the
+    external review asked for (§5, "E3"): :func:`load_items` always
+    returns everything; *this* function decides what a specific paid
+    run actually sends. ``max_variants_per_object=1`` (the CLI default)
+    reproduces the prior version's "keep only the lowest variant"
+    behaviour exactly — same images, same ``image_sha256`` values, same
+    resume keys as any already-paid ``results.jsonl`` rows.
+
+    Args:
+        max_variants_per_object: ``None`` keeps every variant.
+
+    Raises:
+        ValueError: ``max_variants_per_object`` is not ``None`` and not
+            a positive integer.
+    """
+    if max_variants_per_object is None:
+        return items
+    if max_variants_per_object < 1:
+        raise ValueError(
+            f"max_variants_per_object must be a positive integer or None, "
+            f"got {max_variants_per_object!r}."
+        )
+
+    variants_by_slot: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for item in items:
+        variants_by_slot[(item.object_key, item.view)].append(item.variant)
+    allowed_by_slot = {
+        slot: set(sorted(variants)[:max_variants_per_object])
+        for slot, variants in variants_by_slot.items()
+    }
+    return tuple(
+        item for item in items if item.variant in allowed_by_slot[(item.object_key, item.view)]
     )
 
 

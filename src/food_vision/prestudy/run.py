@@ -112,6 +112,13 @@ class ResultRecord:
     object_key: str
     fruit_type: str
     view: str
+    #: Which numbered photo of this (object, view) — see
+    #: ``ecustfd.Item.variant``. Added after the original pre-study spec's
+    #: schema (§4.2) was written; a deliberate, additive deviation per
+    #: the external review's "E3" finding (§5) that only one variant was
+    #: ever being sent. Older rows in ``results.jsonl`` predate this field;
+    #: ``analysis.load_results`` defaults it to ``1`` for those.
+    variant: int
     split: str
     true_g: float
     pred_g: float | None
@@ -377,6 +384,7 @@ def _run_one(
         object_key=item.object_key,
         fruit_type=item.fruit_type,
         view=item.view,
+        variant=item.variant,
         split=item.split,
         true_g=item.weight_g,
         pred_g=pred_g,

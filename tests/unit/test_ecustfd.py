@@ -5,10 +5,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from food_vision.prestudy.ecustfd import (
     Item,
     load_items,
     read_split_csv,
+    select_variants,
     verify_object_grouping,
     write_split_csv,
 )
@@ -115,7 +118,10 @@ class TestLoadItems:
         assert all(item.fruit_type == "apple" for item in report.items)
         assert {item.object_key for item in report.items} == {"apple001", "apple002"}
 
-    def test_picks_lowest_variant_per_object_view(self, tmp_path: Path) -> None:
+    def test_keeps_all_variants_per_object_view(self, tmp_path: Path) -> None:
+        """apple001/side has variants (1) and (2) in the fixture data;
+        both must survive load_items (E3: 'use all variants')— narrowing
+        to one is select_variants' job, not load_items'."""
         snapshot_dir = self._write_csvs(tmp_path)
 
         report = load_items(snapshot_dir, types=frozenset({"apple"}))
@@ -123,21 +129,26 @@ class TestLoadItems:
         side_items = [
             item for item in report.items if item.object_key == "apple001" and item.view == "side"
         ]
-        assert len(side_items) == 1
-        assert side_items[0].variant == 1
-        assert side_items[0].image_path == Path("apple001S(1).JPG")
+        assert {item.variant for item in side_items} == {1, 2}
+        assert {item.image_path for item in side_items} == {
+            Path("apple001S(1).JPG"),
+            Path("apple001S(2).JPG"),
+        }
 
-    def test_one_item_per_object_view(self, tmp_path: Path) -> None:
+    def test_every_object_view_slot_is_present(self, tmp_path: Path) -> None:
         snapshot_dir = self._write_csvs(tmp_path)
 
         report = load_items(snapshot_dir, types=frozenset({"apple", "banana"}))
 
-        keys = [(item.object_key, item.view) for item in report.items]
-        assert len(keys) == len(set(keys))
-        assert ("apple001", "side") in keys
-        assert ("apple001", "top") in keys
-        assert ("apple002", "side") in keys
-        assert ("banana001", "side") in keys
+        # (object_key, view, variant) triples are unique; (object_key, view)
+        # slots need not be (apple001/side has 2 variants).
+        triples = [(item.object_key, item.view, item.variant) for item in report.items]
+        assert len(triples) == len(set(triples))
+        slots = {(item.object_key, item.view) for item in report.items}
+        assert ("apple001", "side") in slots
+        assert ("apple001", "top") in slots
+        assert ("apple002", "side") in slots
+        assert ("banana001", "side") in slots
 
     def test_split_is_deterministic_across_runs(self, tmp_path: Path) -> None:
         snapshot_dir = self._write_csvs(tmp_path)
@@ -200,6 +211,43 @@ class TestLoadItems:
         report = load_items(snapshot_dir, types=frozenset({"apple"}))
 
         assert "apple001-weird-name.JPG" in report.unparsed_filenames
+
+
+class TestSelectVariants:
+    def _items(self) -> tuple[Item, ...]:
+        return (
+            Item(Path("aS1.JPG"), "a", "apple", "side", 100.0, "holdout", 1),
+            Item(Path("aS2.JPG"), "a", "apple", "side", 100.0, "holdout", 2),
+            Item(Path("aS3.JPG"), "a", "apple", "side", 100.0, "holdout", 3),
+            Item(Path("aT1.JPG"), "a", "apple", "top", 100.0, "holdout", 1),
+        )
+
+    def test_default_keeps_only_lowest_variant_per_slot(self) -> None:
+        """max_variants_per_object=1 (the CLI default) must reproduce the
+        prior load_items' 'lowest variant only' behaviour exactly — same
+        images, so already-paid results.jsonl rows stay resumable."""
+        selected = select_variants(self._items(), max_variants_per_object=1)
+
+        assert {(item.object_key, item.view, item.variant) for item in selected} == {
+            ("a", "side", 1),
+            ("a", "top", 1),
+        }
+
+    def test_max_two_keeps_two_lowest_per_slot(self) -> None:
+        selected = select_variants(self._items(), max_variants_per_object=2)
+
+        side_variants = {item.variant for item in selected if item.view == "side"}
+        assert side_variants == {1, 2}
+
+    def test_none_keeps_everything(self) -> None:
+        items = self._items()
+        selected = select_variants(items, max_variants_per_object=None)
+
+        assert selected == items
+
+    def test_rejects_non_positive(self) -> None:
+        with pytest.raises(ValueError, match="positive integer"):
+            select_variants(self._items(), max_variants_per_object=0)
 
 
 class TestSplitCsvRoundTrip:

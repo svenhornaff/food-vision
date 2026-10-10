@@ -176,6 +176,7 @@ class TestAppendResult:
             object_key="apple001",
             fruit_type="apple",
             view="top",
+            variant=1,
             split="holdout",
             true_g=200.0,
             pred_g=190.0,

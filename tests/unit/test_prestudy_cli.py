@@ -36,6 +36,25 @@ class TestBuildParser:
         assert args.repeats == 1
         assert args.dry_run is None
         assert args.budget is None
+        assert args.max_variants_per_object == 1
+
+    def test_run_max_variants_per_object_accepts_all(self) -> None:
+        args = cli.build_parser().parse_args(
+            ["run", "--models", "vendor/a", "--max-variants-per-object", "all"]
+        )
+        assert args.max_variants_per_object is None
+
+    def test_run_max_variants_per_object_accepts_int(self) -> None:
+        args = cli.build_parser().parse_args(
+            ["run", "--models", "vendor/a", "--max-variants-per-object", "3"]
+        )
+        assert args.max_variants_per_object == 3
+
+    def test_run_max_variants_per_object_rejects_zero(self) -> None:
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(
+                ["run", "--models", "vendor/a", "--max-variants-per-object", "0"]
+            )
 
     def test_run_dry_run_and_budget_parsed(self) -> None:
         args = cli.build_parser().parse_args(
@@ -135,6 +154,74 @@ class TestCmdRun:
         assert exit_code == 0
         out = capsys.readouterr().out
         assert "extrapolated full-sweep cost" in out
+
+    def test_max_variants_per_object_default_selects_lowest_variant_only(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """split.csv has 2 variants for the same (object, view); the
+        default ``--max-variants-per-object 1`` must select only one."""
+        split_csv = tmp_path / "split.csv"
+        split_csv.write_text(
+            "object_key,fruit_type,view,image_file,weight_g,split,variant\n"
+            "a,apple,top,a1.JPG,100.0,holdout,1\n"
+            "a,apple,top,a2.JPG,100.0,holdout,2\n"
+        )
+        models_toml = tmp_path / "models.toml"
+        models_toml.write_text('[[models]]\nmodel = "vendor/a"\nprovider_pin = "vendor-provider"\n')
+        monkeypatch.setattr(cli, "download", lambda: tmp_path)
+        monkeypatch.setattr(cli, "get_default_provider", lambda: object())
+        monkeypatch.setattr(cli, "run_sweep", lambda provider, config: RunStats(by_model={}))
+
+        exit_code = cli.main(
+            [
+                "run",
+                "--models",
+                "vendor/a",
+                "--split-csv",
+                str(split_csv),
+                "--models-toml",
+                str(models_toml),
+                "--results",
+                str(tmp_path / "results.jsonl"),
+            ]
+        )
+
+        assert exit_code == 0
+        assert "selected items: 1 (max_variants_per_object=1)" in capsys.readouterr().out
+
+    def test_max_variants_per_object_all_selects_both(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        split_csv = tmp_path / "split.csv"
+        split_csv.write_text(
+            "object_key,fruit_type,view,image_file,weight_g,split,variant\n"
+            "a,apple,top,a1.JPG,100.0,holdout,1\n"
+            "a,apple,top,a2.JPG,100.0,holdout,2\n"
+        )
+        models_toml = tmp_path / "models.toml"
+        models_toml.write_text('[[models]]\nmodel = "vendor/a"\nprovider_pin = "vendor-provider"\n')
+        monkeypatch.setattr(cli, "download", lambda: tmp_path)
+        monkeypatch.setattr(cli, "get_default_provider", lambda: object())
+        monkeypatch.setattr(cli, "run_sweep", lambda provider, config: RunStats(by_model={}))
+
+        exit_code = cli.main(
+            [
+                "run",
+                "--models",
+                "vendor/a",
+                "--max-variants-per-object",
+                "all",
+                "--split-csv",
+                str(split_csv),
+                "--models-toml",
+                str(models_toml),
+                "--results",
+                str(tmp_path / "results.jsonl"),
+            ]
+        )
+
+        assert exit_code == 0
+        assert "selected items: 2 (max_variants_per_object=all)" in capsys.readouterr().out
 
 
 class TestCmdAnalyze:

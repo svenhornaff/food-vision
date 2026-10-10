@@ -47,6 +47,7 @@ def _attempt(
     outcome: str = "ok",
     cost_usd: float | None = 0.001,
     latency_ms: float = 100.0,
+    variant: int = 1,
 ) -> AttemptRecord:
     return AttemptRecord(
         model=model,
@@ -61,6 +62,7 @@ def _attempt(
         outcome=outcome,
         cost_usd=cost_usd,
         latency_ms=latency_ms,
+        variant=variant,
     )
 
 
@@ -114,6 +116,32 @@ class TestLoadResults:
 
         assert len(records) == 1
         assert records[0].model == "m"
+
+    def test_missing_variant_field_defaults_to_one(self, tmp_path: Path) -> None:
+        """Rows written before the 'variant' field existed (the already-
+        paid results.jsonl from before this fix) must still load —
+        defaulting to variant=1, which is exactly what those runs used."""
+        path = tmp_path / "results.jsonl"
+        row = {
+            "model": "m",
+            "strategy": "S1",
+            "repeat": 0,
+            "object_key": "o",
+            "fruit_type": "apple",
+            "view": "top",
+            "split": "holdout",
+            "true_g": 100.0,
+            "pred_g": 90.0,
+            "outcome": "ok",
+            "cost_usd": 0.001,
+            "latency_ms": 100.0,
+            # no "variant" key
+        }
+        path.write_text(json.dumps(row) + "\n")
+
+        records = load_results(path)
+
+        assert records[0].variant == 1
 
 
 class TestComputeB0:
@@ -188,6 +216,58 @@ class TestPredictionsPerObject:
 
         assert len(predictions) == 1
         assert predictions[0].pred_g == 150.0  # B0, not 999.0
+
+    def test_repeats_are_medianed_within_a_slot_before_combining_across_slots(self) -> None:
+        """Object 'a' has one (view, variant) slot with 3 repeats
+        (100/200/300, median 200) and a second slot with a single value
+        (600). Flat-pooling every attempt (the old behaviour) would give
+        median([100,200,300,600]) = 250; the two-level hierarchy must
+        instead median the 3-repeat slot down to one number (200) first,
+        then take median([200, 600]) = 400 — so the heavily-repeated
+        slot doesn't outweigh the other one."""
+        attempts = (
+            _attempt(object_key="a", view="top", variant=1, repeat=0, pred_g=100.0),
+            _attempt(object_key="a", view="top", variant=1, repeat=1, pred_g=200.0),
+            _attempt(object_key="a", view="top", variant=1, repeat=2, pred_g=300.0),
+            _attempt(object_key="a", view="side", variant=1, repeat=0, pred_g=600.0),
+        )
+        holdout_objects = {"a": ("apple", 200.0)}
+
+        predictions = predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            strategy="S1",
+            holdout_objects=holdout_objects,
+            b0_by_type={},
+        )
+
+        assert predictions[0].pred_g == 400.0
+
+    def test_different_variants_are_independent_slots_like_views(self) -> None:
+        """Grouping is by (view, variant), not just view — two variants
+        of the same view are two separate slots, each weighted the same
+        as the third (other-view) slot. With no repeats to collapse
+        within any slot, this equals the flat-pooled median
+        (median([100, 300, 600]) == 300): it's only *repeats* that the
+        two-level hierarchy protects against over-weighting, not
+        variants — which are treated as independent object-level
+        samples, the same as different views."""
+        attempts = (
+            _attempt(object_key="a", view="top", variant=1, repeat=0, pred_g=100.0),
+            _attempt(object_key="a", view="top", variant=2, repeat=0, pred_g=300.0),
+            _attempt(object_key="a", view="side", variant=1, repeat=0, pred_g=600.0),
+        )
+        holdout_objects = {"a": ("apple", 200.0)}
+
+        predictions = predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            strategy="S1",
+            holdout_objects=holdout_objects,
+            b0_by_type={},
+        )
+
+        assert predictions[0].pred_g == 300.0
 
 
 class TestMape:
@@ -272,6 +352,27 @@ class TestRepeatCv:
     def test_none_when_no_qualifying_group(self) -> None:
         attempts = (_attempt(object_key="a", repeat=0, pred_g=100.0),)
         assert repeat_cv(attempts, model="vendor/model-a", strategy="S1") is None
+
+    def test_different_variants_do_not_count_as_repeats(self) -> None:
+        """Two attempts on *different* variants (different photos) of the
+        same (object, view) must NOT form a qualifying repeat-group —
+        that would conflate photo-to-photo noise with model-sampling
+        noise. Each has only 1 attempt for its own variant, so neither
+        qualifies (needs >= 2), and the function returns None."""
+        attempts = (
+            _attempt(object_key="a", view="top", variant=1, repeat=0, pred_g=100.0),
+            _attempt(object_key="a", view="top", variant=2, repeat=0, pred_g=500.0),
+        )
+
+        assert repeat_cv(attempts, model="vendor/model-a", strategy="S1") is None
+
+    def test_same_variant_different_repeats_do_qualify(self) -> None:
+        attempts = (
+            _attempt(object_key="a", view="top", variant=1, repeat=0, pred_g=100.0),
+            _attempt(object_key="a", view="top", variant=1, repeat=1, pred_g=110.0),
+        )
+
+        assert repeat_cv(attempts, model="vendor/model-a", strategy="S1") is not None
 
 
 class TestCostAndLatency:
