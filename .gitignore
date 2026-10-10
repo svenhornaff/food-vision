@@ -30,6 +30,10 @@ bench/runs/**
 !bench/runs/**/split.csv
 !bench/runs/**/models.toml
 
+# Raw third-party dataset clones (large, licensed separately, fetched on
+# demand — see docs/dev/pre-study.md for provenance/citation requirements)
+/data/raw/
+
 # macOS
 .DS_Store
 

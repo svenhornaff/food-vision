@@ -131,6 +131,30 @@ geometry head computes mass).
 - Persist `parsed` and `observations`; print the three worst cases with
   their `observations` text in the report.
 
+## Addendum: independent re-verification (2026-10-10)
+
+The analysis above was re-run from a fresh clone of the original annotation
+source (`github.com/Liang-yc/ECUSTFD-resized-`, `master` branch, now at
+`data/raw/ecustfd/`, gitignored — see `README.md` “Dataset” section for the
+fetch command) rather than trusting the committed `bbox_oracle.json` at face
+value. All headline numbers reproduce bit-for-bit: MAPE 8.1%, MedAPE 7.5%,
+bias -3.3%, β 0.98, and all three bootstrap CIs, for `bbox top+side`; B0 and
+the top-only/side-only rows match identically too.
+
+One discrepancy found and not silently resolved: the committed file reports
+`skipped_images: 0`; the fresh run reports `61`. `n_images: 1014` and every
+metric match exactly in both runs, so this does not change the finding — but
+it means the original run's skip-counter was likely not wired up correctly
+(or ran against a filtered annotation subset), and should not be read as
+"every annotation file was usable." Worth fixing in any follow-on version of
+`bbox_oracle.py` rather than carrying the discrepancy forward silently.
+
+Also checked: `density.xls` in the same repo is not a separate density
+lookup table — it duplicates the `(type, volume_mm3, weight_g)` tuple
+already present in the HF mirror's `portions.csv` (spot-checked `apple007`:
+420 mm³ / 325.0 g in both sources). No new information for `domain/calculator.py`’s
+fitted constants from this file.
+
 ## Sources
 
 - Liang & Li, *Computer vision-based food calorie estimation: dataset, method, and experiment* (ECUSTFD; coin calibration, Faster R-CNN + GrabCut + shape models): https://arxiv.org/abs/1705.07632 ; https://arxiv.org/pdf/1706.04062
