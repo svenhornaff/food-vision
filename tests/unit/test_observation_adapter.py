@@ -97,6 +97,34 @@ class TestPromptSetAndMaxTokens:
         with pytest.raises(FileNotFoundError, match="ecustfd"):
             observe(provider, images=[b"img"], config=config, routing=_routing())
 
+    def test_ecustfd_bbox_prompt_round_trips_to_ok(self) -> None:
+        """review.md §5 'E1': ask for boxes instead of mass_g. No
+        strategy-specific branch should be needed in observe()/_classify
+        — generic parsed-dict validation covers it, same as S1/S2/S3."""
+        parsed = {
+            "observations": "a kiwi beside a coin",
+            "coin_xmin": 0.10,
+            "coin_ymin": 0.80,
+            "coin_xmax": 0.20,
+            "coin_ymax": 0.90,
+            "fruit_xmin": 0.30,
+            "fruit_ymin": 0.20,
+            "fruit_xmax": 0.70,
+            "fruit_ymax": 0.60,
+        }
+        provider = _FakeProvider(_completion(parsed=parsed))
+        config = ObservationConfig(strategy=ObservationStrategy.BBOX, prompt_set="ecustfd")
+
+        observation = observe(provider, images=[b"img"], config=config, routing=_routing())
+
+        assert observation.outcome is ObservationOutcome.OK
+        assert observation.values == parsed
+        received = provider.received_kwargs
+        assert received is not None
+        text = received["messages"][0]["content"][0]["text"]
+        assert "coin" in text
+        assert "xmin" in text
+
     def test_max_tokens_forwarded_to_provider(self) -> None:
         provider = _FakeProvider(_completion(parsed={"observations": "x", "mass_g": 100.0}))
         config = ObservationConfig(strategy=ObservationStrategy.S1, max_tokens=2048)

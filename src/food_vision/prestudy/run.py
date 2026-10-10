@@ -18,6 +18,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from food_vision.imaging.preprocess import ImageConfig, normalize
 from food_vision.observation.adapter import (
@@ -122,6 +123,13 @@ class ResultRecord:
     split: str
     true_g: float
     pred_g: float | None
+    #: The full validated observation (pre-study.md §4.2 schema has no
+    #: field for this; added for the "BBOX" strategy (review §5, "E1"),
+    #: whose fields aren't a single number — ``None`` when the outcome
+    #: isn't ``ok``. Also closes a review-flagged gap (§2) for the
+    #: existing mass strategies: ``observations`` text used to be
+    #: discarded after classification.
+    parsed: dict[str, Any] | None
     outcome: str
     model_resolved: str | None
     generation_id: str | None
@@ -373,7 +381,10 @@ def _run_one(
 
     observation = observe_fn(provider, images=[normalized], config=obs_config, routing=routing)
     completion = observation.completion
-    pred_g = observation.values["mass_g"] if observation.values is not None else None
+    # .get(), not []: S2/BBOX observations have no "mass_g" key (their
+    # mass is derived downstream, by the calculator or
+    # bbox_vlm_eval.py, not here).
+    pred_g = observation.values.get("mass_g") if observation.values is not None else None
 
     record = ResultRecord(
         key=key,
@@ -388,6 +399,7 @@ def _run_one(
         split=item.split,
         true_g=item.weight_g,
         pred_g=pred_g,
+        parsed=observation.values,
         outcome=observation.outcome.value,
         model_resolved=completion.model_resolved,
         generation_id=completion.generation_id,

@@ -36,6 +36,13 @@ class ObservationStrategy(StrEnum):
     S1 = "S1"  # direct mass_g estimate
     S2 = "S2"  # length_cm + max_diameter_cm; calculator derives mass
     S3 = "S3"  # direct mass_g estimate, prompt states a dev-derived prior
+    #: Not in pre-study.md's original §3 — added for the "E1" experiment
+    #: in bench/reports/prestudy-lean/review.md §5: ask the model for
+    #: normalised [0,1] bounding boxes of the coin and the fruit instead
+    #: of a mass estimate; bench/scripts/bbox_vlm_eval.py does the
+    #: coin-scaled geometry → mass_g conversion (same formulas as
+    #: bbox_oracle.py), not this module.
+    BBOX = "BBOX"
 
 
 class StructuredOutputMode(StrEnum):
@@ -53,13 +60,34 @@ class ObservationValidationError(ValueError):
     ``invalid`` outcome (§7.2)."""
 
 
+_BBOX_FIELDS = (
+    "coin_xmin",
+    "coin_ymin",
+    "coin_xmax",
+    "coin_ymax",
+    "fruit_xmin",
+    "fruit_ymin",
+    "fruit_xmax",
+    "fruit_ymax",
+)
+
 _GRAM_FIELDS: dict[ObservationStrategy, tuple[str, ...]] = {
     ObservationStrategy.S1: ("observations", "mass_g"),
     ObservationStrategy.S3: ("observations", "mass_g"),
     ObservationStrategy.S2: ("observations", "length_cm", "max_diameter_cm"),
+    ObservationStrategy.BBOX: ("observations", *_BBOX_FIELDS),
 }
 
 _NUMERIC_FIELDS = frozenset({"mass_g", "length_cm", "max_diameter_cm"})
+#: Normalised-coordinate fields (§BBOX): range is [0, 1], not "any
+#: non-negative number" like the gram/cm fields above.
+_UNIT_INTERVAL_FIELDS = frozenset(_BBOX_FIELDS)
+#: (xmin, ymin, xmax, ymax) tuples that must each describe a positive-area
+#: box — checked after the per-field range check.
+_BBOX_BOXES = (
+    ("coin_xmin", "coin_ymin", "coin_xmax", "coin_ymax"),
+    ("fruit_xmin", "fruit_ymin", "fruit_xmax", "fruit_ymax"),
+)
 
 
 def schema_for(strategy: ObservationStrategy) -> JsonSchemaFormat:
@@ -67,7 +95,10 @@ def schema_for(strategy: ObservationStrategy) -> JsonSchemaFormat:
     fields = _GRAM_FIELDS[strategy]
     properties: dict[str, Any] = {"observations": {"type": "string"}}
     for field_name in fields[1:]:
-        properties[field_name] = {"type": "number"}
+        if field_name in _UNIT_INTERVAL_FIELDS:
+            properties[field_name] = {"type": "number", "minimum": 0, "maximum": 1}
+        else:
+            properties[field_name] = {"type": "number"}
     schema = {
         "type": "object",
         "properties": properties,
@@ -102,16 +133,30 @@ def validate_observation(strategy: ObservationStrategy, value: Any) -> dict[str,
 
     result: dict[str, Any] = {"observations": value["observations"]}
     for field_name in fields:
-        if field_name not in _NUMERIC_FIELDS:
+        if field_name not in _NUMERIC_FIELDS and field_name not in _UNIT_INTERVAL_FIELDS:
             continue
         raw = value[field_name]
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             raise ObservationValidationError(f"'{field_name}' must be a number.")
         number = float(raw)
-        if not math.isfinite(number) or number < 0:
+        if field_name in _UNIT_INTERVAL_FIELDS:
+            if not math.isfinite(number) or not (0.0 <= number <= 1.0):
+                raise ObservationValidationError(
+                    f"'{field_name}' must be a finite number in [0, 1], got {raw!r}."
+                )
+        elif not math.isfinite(number) or number < 0:
             raise ObservationValidationError(
                 f"'{field_name}' must be a finite, non-negative number, got {raw!r}."
             )
         result[field_name] = number
+
+    if strategy is ObservationStrategy.BBOX:
+        for xmin_name, ymin_name, xmax_name, ymax_name in _BBOX_BOXES:
+            if result[xmax_name] <= result[xmin_name] or result[ymax_name] <= result[ymin_name]:
+                raise ObservationValidationError(
+                    f"Degenerate or inverted box: {xmin_name}/{ymin_name}/"
+                    f"{xmax_name}/{ymax_name} = {result[xmin_name]}, {result[ymin_name]}, "
+                    f"{result[xmax_name]}, {result[ymax_name]}."
+                )
 
     return result

@@ -32,6 +32,22 @@ def test_schema_s2_requires_dimensions() -> None:
     assert schema["required"] == ["observations", "length_cm", "max_diameter_cm"]
 
 
+def test_schema_bbox_requires_eight_box_fields() -> None:
+    schema = schema_for(ObservationStrategy.BBOX).schema
+    assert schema["required"] == [
+        "observations",
+        "coin_xmin",
+        "coin_ymin",
+        "coin_xmax",
+        "coin_ymax",
+        "fruit_xmin",
+        "fruit_ymin",
+        "fruit_xmax",
+        "fruit_ymax",
+    ]
+    assert schema["properties"]["coin_xmin"] == {"type": "number", "minimum": 0, "maximum": 1}
+
+
 def test_schema_has_no_confidence_field() -> None:
     for strategy in ObservationStrategy:
         assert "confidence" not in schema_for(strategy).schema["properties"]
@@ -51,6 +67,48 @@ def test_validate_observation_accepts_valid_s2() -> None:
     )
     assert result["length_cm"] == 19.8
     assert result["max_diameter_cm"] == 3.6
+
+
+def _bbox_value(**overrides: float) -> dict[str, object]:
+    base = {
+        "observations": "a kiwi beside a coin",
+        "coin_xmin": 0.10,
+        "coin_ymin": 0.80,
+        "coin_xmax": 0.20,
+        "coin_ymax": 0.90,
+        "fruit_xmin": 0.30,
+        "fruit_ymin": 0.20,
+        "fruit_xmax": 0.70,
+        "fruit_ymax": 0.60,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_validate_observation_accepts_valid_bbox() -> None:
+    result = validate_observation(ObservationStrategy.BBOX, _bbox_value())
+    assert result["coin_xmin"] == 0.10
+    assert result["fruit_ymax"] == 0.60
+
+
+@pytest.mark.parametrize("bad_value", [-0.1, 1.1, float("nan"), float("inf")])
+def test_validate_observation_rejects_out_of_unit_interval(bad_value: float) -> None:
+    with pytest.raises(ObservationValidationError, match=r"\[0, 1\]"):
+        validate_observation(ObservationStrategy.BBOX, _bbox_value(coin_xmin=bad_value))
+
+
+def test_validate_observation_rejects_degenerate_box() -> None:
+    """xmax <= xmin: zero or negative width."""
+    with pytest.raises(ObservationValidationError, match="Degenerate"):
+        validate_observation(
+            ObservationStrategy.BBOX, _bbox_value(fruit_xmin=0.70, fruit_xmax=0.70)
+        )
+
+
+def test_validate_observation_rejects_inverted_box() -> None:
+    """ymax < ymin: boxes the model reported back-to-front."""
+    with pytest.raises(ObservationValidationError, match="Degenerate"):
+        validate_observation(ObservationStrategy.BBOX, _bbox_value(coin_ymin=0.90, coin_ymax=0.80))
 
 
 def test_validate_observation_rejects_non_dict() -> None:

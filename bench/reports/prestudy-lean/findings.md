@@ -1,13 +1,18 @@
 # Pre-study findings (ECUSTFD, lean hold-out sweep)
 
-**Result: stop and rethink before Phase 0.** No candidate model clears the
-decision gates defined in `docs/dev/pre-study.md` §5. This is written up as
-the pre-study's actual conclusion, not as a blocked or incomplete run.
+**Superseded, 2026-10-10 — see §6.** Sections 1–5 below are the original
+write-up for the direct-mass-estimation strategies (S1/S3) and still stand
+as an accurate description of *those* strategies: no model clears the
+decision gates asking a VLM to estimate mass directly. But the
+"resolution floor" explanation in §3 does not hold as a limit on the
+architecture as a whole — §6 shows the size signal is recoverable from the
+same photos once localisation (find the coin and the fruit) is separated
+from measurement (compute mass in code from the boxes).
 
-See `report.md` for the metrics table and `decision.md` for the mechanical
-gate output. This file adds the *why* behind the numbers, using targeted
-diagnostic calls made after the hold-out sweep completed, and states what
-remains untested.
+See `report.md` for the S1/S3 metrics table and `decision.md` for the
+mechanical gate output on those strategies. This file adds the *why*
+behind the numbers, using targeted diagnostic calls made after the
+hold-out sweep completed.
 
 ## 1. What was run
 
@@ -125,3 +130,71 @@ evidence. Before spending further model-sweep budget, prioritise:
    (e.g. leaning harder on class-typical priors plus a cheap
    measured-reference input, rather than photo-derived linear
    dimensions) may be more productive than continuing to screen models.
+
+## 6. Correction (2026-10-10): the resolution floor does not hold — it's a strategy problem, not a signal problem
+
+An external review (`review.md` §4) ran the coin-scaled geometry formula
+(top-view `(w·h)^1.5`, side-view `w·h·min(w,h)`, combined top+side, §4.1
+ of `review.md`) against the dataset's *ground-truth* annotation boxes
+instead of a VLM's mass estimate: **8.1% MAPE, β=0.98** on the same 25
+hold-out objects. β≈1 means the size signal **is** present in the pixels
+at a resolution far better than §3's "resolution floor" hypothesis
+claimed — §3's reasoning was sound given what was tested (direct mass
+estimation), but the conclusion it supported (a perceptual ceiling) was
+wrong. The real bottleneck is that asking a VLM for a holistic mass
+number lets it fall back to a category-typical guess instead of
+measuring; asking it to *localise* two objects is a different, and much
+easier, task.
+
+**E1** (`review.md` §5) tested the realistic version of that 8.1% bound:
+ask each VLM for normalised `[0,1]` bounding boxes of the coin and the
+fruit (new `BBOX` strategy, `src/food_vision/observation/schema.py`),
+then compute mass in code from those *predicted* boxes using the same
+formula and the same dev-fitted per-type constants as the ground-truth
+oracle (`bench/scripts/bbox_vlm_eval.py`). 100/100 calls `ok`, cost $0.78,
+full results in `bbox_vlm_eval.json`:
+
+| Model | n | MAPE | MedAPE | Bias | β |
+|---|---|---|---|---|---|
+| Ground-truth-box oracle (upper bound) | 23 | 8.1% | 7.5% | -3.3% | 0.98 |
+| `google/gemini-3.5-flash`, VLM boxes | 25 | **11.9%** | 8.6% | +0.8% | 1.14 |
+| `anthropic/claude-sonnet-4.6`, VLM boxes | 25 | 89.3% | 80.3% | +72.2% | 1.14 |
+
+For comparison, direct mass estimation (S1) on the same 25 objects scored
+19.9% (Gemini) and 27.7% (Claude) MAPE with β=0.33/0.17 — **Gemini's
+box-then-compute MAPE (11.9%) beats its own direct-estimate MAPE (19.9%)
+and comes within 3.8 points of the ground-truth oracle**, with β rising
+from 0.33 to 1.14. This is a materially different, more actionable result
+than §3's "stop and rethink": the architecture the external review
+proposed (VLM localises, code measures) works, at least for this model.
+
+**Claude's 89.3% MAPE is a specific, diagnosed failure, not a second
+counter-example to the architecture.** Its predicted coin box collapses
+in side-view photos specifically: median coin-box aspect ratio 2.29
+(max 3.40) in side views vs. 1.38 in top views, vs. Gemini's tight
+1.2–1.4 in *both* views. A real 25mm coin photographed at a shallow side
+angle foreshortens to an ellipse, not a 2.3:1-elongated rectangle —
+Claude's side-view coin localisation is simply inaccurate, which corrupts
+the mm-per-pixel scale factor and cascades into wildly overestimated
+mass. β=1.14 for Claude too (same as Gemini, both with wide/degenerate
+bootstrap CIs from the small sample) shows it is tracking relative size
+correctly when the scale factor isn't broken — this is a localisation
+reliability problem for this specific model, not evidence against the
+approach.
+
+**Revised recommendation**: do not stop. The direct-mass strategies
+(S1/S3) are the wrong strategy, not evidence that VLM-assisted size
+estimation is infeasible. Before Phase 0:
+
+1. Confirm Gemini's box-then-compute result holds on a second,
+   independent image set (own-photo transfer, `review.md`'s E6) — this
+   pre-study's 23-25 hold-out objects is still a small sample, and the
+   dev-fitted `k` constants are specific to this dataset's camera
+   distance/framing.
+2. Investigate whether Claude's side-view coin localisation improves
+   with a prompt change (e.g. asking explicitly for the coin's two
+   semi-axes under foreshortening) before concluding it's unusable — not
+   yet attempted.
+3. The §4 "wider weight spread" diagnostic is no longer the priority
+   question it was under the resolution-floor hypothesis; §6 already
+   answers "is there a resolvable signal" (yes, via localisation).
