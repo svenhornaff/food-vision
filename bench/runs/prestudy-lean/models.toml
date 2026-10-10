@@ -1,0 +1,135 @@
+# Pre-study candidate models (docs/dev/pre-study.md §3: "one pinned
+# provider per model"). Loaded by `prestudy run` via
+# food_vision.prestudy.run.load_models_toml(); every --models entry must
+# have a block here or `run` refuses to start.
+#
+# provider_pin values verified against OpenRouter's live endpoints
+# listing for each model (https://openrouter.ai/api/v1/models/<id>/endpoints),
+# corrected against live dry-run 404s where the static listing alone
+# was not sufficient to pick a working pin (see notes per model).
+
+[[models]]
+model = "openai/gpt-4o-mini"
+# Three endpoints exist: "openai", "azure", "azure/swedencentral".
+# First attempt pinned "openai" -- failed with a live 404: our proxy's
+# ZDR/data_collection=deny requirement (proxy/openrouter.py's
+# RoutingMode.BENCHMARK defaults) filters OpenRouter's "openai" endpoint
+# out entirely for this account ("Filter by Data Policy removed
+# openai"), and azure/swedencentral was separately removed by a regional
+# surcharge filter -- leaving only "azure", which pin=openai +
+# allow_fallbacks=false then also excluded ("Filter by Fallback").
+# Re-pinned to "azure"; dry-run 5 then succeeded (5/5 ok).
+provider_pin = "azure"
+temperature_zero_ok = true
+notes = "gpt-4o-mini via OpenRouter, provider_pin=azure. dry-run 5/dev/S1 on 2026-10-09: 5/5 ok, schema-valid, but every prediction was exactly 150.0g regardless of true weight (232.5-325g across the 5 images) -- looks like a non-perceiving constant guess rather than real size estimation. Treat as a plausible B0-tier result, not yet confirmed against a full sweep."
+
+[[models]]
+model = "anthropic/claude-sonnet-4.6"
+# Live 404 on first attempt (pin=anthropic): our ZDR/data_collection=deny
+# filter removed "claude-on-aws", "azure/global" AND "anthropic" (the
+# direct endpoint) -- unlike gpt-4o-mini, here ALL three
+# non-regional-surcharge-filtered low-latency endpoints failed data
+# policy. Only "amazon-bedrock/global" and "google-vertex/global"
+# survived the data-policy filter; re-pinned to amazon-bedrock/global.
+provider_pin = "amazon-bedrock/global"
+temperature_zero_ok = true
+notes = "anthropic/claude-sonnet-4.6 via OpenRouter, provider_pin=amazon-bedrock/global (the only ZDR-compliant endpoints for this model are amazon-bedrock/global and google-vertex/global -- anthropic/azure-global/claude-on-aws all fail our data_collection=deny filter). Frontier-tier candidate, tested after gpt-4o-mini's flat/non-perceiving 150.0g result to establish whether any candidate can perceive size at all. dry-run 5/dev/S1 on 2026-10-10: 5/5 ok, predictions varied with true weight (180-280g vs true 232.5-325g), clearly not a constant guess."
+
+[[models]]
+model = "openai/gpt-4.1"
+# Three endpoints, same shape as gpt-4o-mini: "azure" x2 and "openai"
+# (direct). Pre-emptively pinned to "azure" without a 404 round-trip,
+# since gpt-4o-mini's direct "openai" endpoint already failed our
+# ZDR/data_collection=deny filter on this account -- same vendor, same
+# filter, so direct "openai" is expected to fail here too.
+provider_pin = "azure"
+temperature_zero_ok = true
+notes = "openai/gpt-4.1 via OpenRouter, provider_pin=azure (direct openai endpoint not tried -- expected to fail ZDR filter same as gpt-4o-mini's did). Flagship, non-reasoning (reasoning.mandatory=false, unlike gpt-6.1-sol which forces reasoning tokens against max_tokens). Third candidate: same OpenAI family as gpt-4o-mini but higher capability, to see if the flat 150.0g result was mini-tier-specific or an OpenAI-wide prompt/schema issue. dry-run 5/dev/S1 on 2026-10-10: 5/5 ok via azure on first try; predictions varied by object (180/220/220) but identical across side/top views per object, and apple007 (heaviest true weight) tied apple002's prediction -- weaker size discrimination than claude-sonnet-4.6, stronger than gpt-4o-mini."
+
+[[models]]
+model = "google/gemini-3.1-flash-lite"
+# GA, economical tier, reasoning.mandatory=false (won't burn max_tokens
+# on reasoning). Live 404 on first attempt (pin=google-ai-studio): our
+# data_collection=deny filter removed it, same pattern as openai/azure
+# and anthropic/bedrock above. Re-pinned to google-vertex/global, the
+# survivor (google-vertex/eu and /us were separately removed by a
+# regional surcharge filter; /flex and /priority variants were removed
+# as tier rows we did not opt into).
+provider_pin = "google-vertex/global"
+temperature_zero_ok = true
+notes = "google/gemini-3.1-flash-lite via OpenRouter, provider_pin=google-vertex/global (google-ai-studio fails our ZDR/data_collection=deny filter). Fourth candidate: cross-vendor economical-tier counterpart to gpt-4o-mini, added to see whether the flat/non-perceiving result is OpenAI-specific or a general economical-tier limitation. dry-run 5/dev/S1 on 2026-10-10: 5/5 ok via google-vertex/global; cheapest of 4 candidates ($0.04 extrapolated full sweep) but clusters near 220g like gpt-4.1, no better discrimination on the heaviest object."
+
+# z-ai/glm-4.6v tried and rejected: live 404, "Filter by Parameters" --
+# neither of its two endpoints (novita/bf16, z-ai/fp8) supports the
+# strict json_schema structured output our proxy requires in benchmark
+# mode. Not viable via OpenRouter today; left out of models.toml.
+
+# z-ai/glm-4.5v tried and rejected too: same live 404, "Filter by
+# Parameters" -- neither of its two endpoints (novita/fp8, z-ai/fp8)
+# supports strict json_schema structured output either, despite both
+# listing plain response_format. GLM vision models are not viable
+# candidates via OpenRouter today under our strict-schema requirement;
+# left out of models.toml. Re-check if OpenRouter or Z.ai adds
+# structured_outputs support to these endpoints later.
+
+[[models]]
+model = "qwen/qwen3-vl-8b-instruct"
+# Single endpoint (parasail/bf16), explicitly lists both
+# "response_format" and "structured_outputs" in supported_parameters --
+# unlike both GLM models above, this should actually clear our strict
+# json_schema requirement. Open-weight (Qwen3-VL-8B), the base model
+# behind Food-R1 -- the open baseline the concept doc calls for.
+# reasoning.mandatory=false (instruct variant, not thinking).
+provider_pin = "parasail"
+temperature_zero_ok = true
+notes = "qwen/qwen3-vl-8b-instruct via OpenRouter, provider_pin=parasail (only endpoint, no fallback available). Sixth candidate, open-weight baseline per concept doc's interest in a contamination-free, non-proprietary comparison point -- base model for Food-R1. Schema/parameter compatibility confirmed (structured_outputs supported), but every attempt on 2026-10-10 hit a 429 from Parasail's upstream_provider_shared_pool (not our ZDR/schema config, confirmed via error metadata) across 3 tries over ~70s. Not yet successfully smoke-tested -- retry later, or add a Parasail BYOK key, or accept this model has no working fallback endpoint today."
+
+[[models]]
+model = "google/gemini-3.5-flash"
+# 7 endpoints, all list temperature+structured_outputs+max_tokens (no
+# gap like Sonnet-5/GPT-5). Reusing the pin pattern that worked for
+# gemini-3.1-flash-lite: direct "google-ai-studio" fails our
+# data_collection=deny filter; "google-vertex/global" (base, not
+# /flex or /priority) is the non-regional, non-tiered survivor.
+provider_pin = "google-vertex/global"
+temperature_zero_ok = true
+notes = "google/gemini-3.5-flash via OpenRouter, provider_pin=google-vertex/global. Ninth candidate, mid-tier economical/fast model (near-Pro coding/reasoning at flash-tier cost per OpenRouter's description). Not yet smoke-tested."
+
+[[models]]
+model = "anthropic/claude-sonnet-5"
+# Successor line to claude-sonnet-4.6 (already confirmed working via
+# amazon-bedrock/global). Many endpoints (anthropic, azure/global,
+# google-vertex/global, amazon-bedrock/global, + regional variants),
+# amazon-bedrock/global explicitly lists structured_outputs -- reusing
+# the pin that worked for the 4.6 generation.
+provider_pin = "google-vertex/global"
+# Live smoke test round 1 (2026-10-10): 404 before the temperature fix,
+# "Filter by Parameters" (0 endpoints). Round 2, after adding
+# send_temperature=False: amazon-bedrock/global *still* got removed by
+# "Filter by Parameters" -- it lacks structured_outputs support too (a
+# second, independent gap from temperature) -- but google-vertex/global
+# survived every filter except "Filter by Fallback" (it wasn't the
+# pinned endpoint, and allow_fallbacks=false). Re-pinned to
+# google-vertex/global, which explicitly lists both temperature... no,
+# it also omits temperature, hence temperature_zero_ok=false still
+# applies; it does list structured_outputs, unlike amazon-bedrock/global.
+temperature_zero_ok = false
+notes = "anthropic/claude-sonnet-5 via OpenRouter, provider_pin=google-vertex/global (changed from amazon-bedrock/global, which lacks structured_outputs support on top of the temperature gap). Seventh candidate: newer Sonnet generation -- NONE of its 10 endpoints supports temperature at all, hence temperature_zero_ok=false. Not yet re-tested with this pin."
+
+[[models]]
+model = "openai/gpt-5"
+# Endpoints: azure (base tag), openai/default, azure/swedencentral.
+# Same pattern as gpt-4o-mini and gpt-4.1: "azure" base tag worked,
+# direct "openai" failed our data_collection=deny filter, regional
+# azure/swedencentral failed a regional-surcharge filter. Reusing
+# "azure" base pin.
+provider_pin = "azure"
+# Live smoke test (2026-10-10): 404, "Filter by Parameters" -- only 1 of
+# 3 endpoints survived regional-surcharge + data-policy filtering, 0
+# survived parameter filtering. The "azure" base endpoint's
+# supported_parameters lists neither "temperature" (reasoning_effort
+# replaces it) nor "max_tokens" (wants "max_completion_tokens" instead).
+# Both temperature_zero_ok=false and max_tokens_param are needed.
+temperature_zero_ok = false
+max_tokens_param = "max_completion_tokens"
+notes = "openai/gpt-5 via OpenRouter, provider_pin=azure (same pattern that worked for gpt-4o-mini and gpt-4.1). Eighth candidate: flagship GPT-5 generation -- its azure endpoint supports neither temperature nor max_tokens under their usual names (confirmed via live 404 + supported_parameters inspection), hence temperature_zero_ok=false and max_tokens_param=max_completion_tokens. Not yet re-tested with the fix."
