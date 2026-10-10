@@ -1,5 +1,7 @@
 # Pre-study decision
 
-No model passes all gates (gain>=30%, beta in [0.7,1.3], |bias|<=10%, validity>=98%). Stop and rethink before Phase 0.
+Default/fallback chosen from models passing all gates, ranked by MAPE.
 
-**Result: stop.**
+**Default model:** `google/gemini-3.5-flash`
+**Default strategy:** BBOX
+**Fallback:** none (no passing model from a different vendor).

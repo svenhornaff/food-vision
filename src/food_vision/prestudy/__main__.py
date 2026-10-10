@@ -20,6 +20,7 @@ from food_vision.prestudy.analysis import (
     compute_b0,
     compute_metrics,
     decide,
+    load_kfit,
     load_results,
 )
 from food_vision.prestudy.ecustfd import (
@@ -40,6 +41,7 @@ _DEFAULT_SPLIT_CSV = Path("bench/runs/prestudy-lean/split.csv")
 _DEFAULT_RESULTS = Path("bench/runs/prestudy-lean/results.jsonl")
 _DEFAULT_MODELS_TOML = Path("bench/runs/prestudy-lean/models.toml")
 _DEFAULT_REPORT_DIR = Path("bench/reports/prestudy-lean")
+_DEFAULT_KFIT = Path("bench/runs/prestudy-lean/kfit.json")
 
 
 def _parse_max_variants(value: str) -> int | None:
@@ -135,6 +137,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         for item in items
         if item.split == "holdout"
     }
+    # Only needed if any BBOX attempts exist; absent otherwise (older
+    # results.jsonl / no kfit.json yet) shouldn't block S1/S3-only runs.
+    kfit = load_kfit(args.kfit) if args.kfit.exists() else None
 
     attempted_models = sorted({a.model for a in attempts})
     chosen_by_model = {}
@@ -155,7 +160,17 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
                 holdout_objects=holdout_objects,
                 b0_by_type=b0_by_type,
             )
-        chosen_by_model[model] = choose_strategy_per_model(s1, s3)
+        bbox = None
+        if kfit is not None and any(a.strategy == "BBOX" and a.model == model for a in attempts):
+            bbox = compute_metrics(
+                attempts,
+                model=model,
+                strategy="BBOX",
+                holdout_objects=holdout_objects,
+                b0_by_type=b0_by_type,
+                kfit=kfit,
+            )
+        chosen_by_model[model] = choose_strategy_per_model(s1, s3, bbox)
 
     decision = decide(chosen_by_model)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--results", type=Path, default=_DEFAULT_RESULTS)
     analyze_parser.add_argument("--split-csv", type=Path, default=_DEFAULT_SPLIT_CSV)
     analyze_parser.add_argument("--out-dir", type=Path, default=_DEFAULT_REPORT_DIR)
+    analyze_parser.add_argument("--kfit", type=Path, default=_DEFAULT_KFIT)
     analyze_parser.set_defaults(handler=_cmd_analyze)
 
     return parser

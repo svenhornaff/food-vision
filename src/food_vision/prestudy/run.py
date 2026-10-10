@@ -12,6 +12,7 @@ distinction between a "real" and "live" call; every call here is live.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
 from collections import defaultdict
@@ -19,6 +20,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from food_vision.imaging.preprocess import ImageConfig, normalize
 from food_vision.observation.adapter import (
@@ -130,6 +133,13 @@ class ResultRecord:
     #: existing mass strategies: ``observations`` text used to be
     #: discarded after classification.
     parsed: dict[str, Any] | None
+    #: The sent (post-``normalize()``) image's pixel dimensions. Needed to
+    #: convert a "BBOX" strategy's normalised ``[0,1]`` coordinates to mm
+    #: (``analysis.bbox_predictions_per_object``) without re-decoding the
+    #: raw image file at analysis time. ``None`` for rows written before
+    #: this field existed.
+    image_width_px: int | None
+    image_height_px: int | None
     outcome: str
     model_resolved: str | None
     generation_id: str | None
@@ -345,6 +355,8 @@ def _run_one(
     raw = (config.snapshot_dir / "images" / item.image_path).read_bytes()
     normalized = normalize(raw, config.image_config)
     image_sha256 = hashlib.sha256(normalized).hexdigest()
+    with Image.open(io.BytesIO(normalized)) as decoded:
+        image_width_px, image_height_px = decoded.size
 
     key = build_key(
         model=model_spec.model, strategy=strategy, image_sha256=image_sha256, repeat=repeat
@@ -400,6 +412,8 @@ def _run_one(
         true_g=item.weight_g,
         pred_g=pred_g,
         parsed=observation.values,
+        image_width_px=image_width_px,
+        image_height_px=image_height_px,
         outcome=observation.outcome.value,
         model_resolved=completion.model_resolved,
         generation_id=completion.generation_id,

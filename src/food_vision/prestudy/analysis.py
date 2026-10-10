@@ -33,6 +33,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -44,8 +45,10 @@ __all__ = [
     "ModelStrategyMetrics",
     "Decision",
     "load_results",
+    "load_kfit",
     "compute_b0",
     "predictions_per_object",
+    "bbox_predictions_per_object",
     "mape",
     "geometric_bias",
     "size_slope_beta",
@@ -89,6 +92,17 @@ class AttemptRecord:
     #: ``run.ResultRecord.variant``'s docstring) — those runs only ever
     #: used variant 1, so the default is exact, not a guess.
     variant: int = 1
+    #: The strategy's full validated observation (``None`` if ``outcome``
+    #: wasn't ``ok``, or for rows written before this field existed).
+    #: Needed for ``strategy=="BBOX"``, whose mass isn't a single number
+    #: on its own (review.md §5 "E1") — ``None`` defaults here are never
+    #: silently wrong for BBOX specifically, since BBOX didn't exist
+    #: before this field did.
+    parsed: dict[str, Any] | None = None
+    #: The sent image's pixel dimensions, needed to convert BBOX's
+    #: normalised ``[0,1]`` coordinates to mm. ``None`` for older rows.
+    image_width_px: int | None = None
+    image_height_px: int | None = None
 
 
 def load_results(path: Path) -> tuple[AttemptRecord, ...]:
@@ -121,9 +135,34 @@ def load_results(path: Path) -> tuple[AttemptRecord, ...]:
                     cost_usd=raw["cost_usd"],
                     latency_ms=raw["latency_ms"],
                     variant=raw.get("variant", 1),
+                    parsed=raw.get("parsed"),
+                    image_width_px=raw.get("image_width_px"),
+                    image_height_px=raw.get("image_height_px"),
                 )
             )
     return tuple(records)
+
+
+def load_kfit(path: Path) -> dict[str, float]:
+    """The ground-truth-box-fitted per-fruit-type mass constant (§BBOX
+    strategy; ``bench/scripts/fit_k.py``). "Conservative and fine" per
+    review.md §5 as the reference k; per-model dev-fitted k is a
+    documented follow-up, not implemented here.
+
+    Raises:
+        OSError: ``path`` doesn't exist or isn't readable.
+        ValueError: ``path``'s contents aren't a JSON object of
+            ``{fruit_type: float}``.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, (int, float)) for k, v in raw.items()
+    ):
+        raise ValueError(f"{path} must contain a JSON object of {{fruit_type: float}}.")
+    return {str(k): float(v) for k, v in raw.items()}
 
 
 def compute_b0(items: tuple[Item, ...]) -> dict[str, float]:
@@ -187,6 +226,84 @@ def predictions_per_object(
         slot_medians = slot_medians_by_object.get(object_key)
         if slot_medians:
             pred_g = float(np.median(slot_medians))
+            had_ok = True
+        else:
+            pred_g = b0_by_type[fruit_type]
+            had_ok = False
+        results.append(ObjectPrediction(object_key, fruit_type, true_g, pred_g, had_ok))
+    return tuple(sorted(results, key=lambda p: p.object_key))
+
+
+def _box_wh_mm(
+    parsed: dict[str, Any], image_width_px: int, image_height_px: int
+) -> tuple[float, float] | None:
+    """(fruit_w_mm, fruit_h_mm) from a "BBOX" attempt's normalised
+    ``[0,1]`` boxes, scaled by *this attempt's own* predicted coin box
+    (never ground truth — a real pipeline has no access to that either;
+    same method as ``bench/scripts/bbox_vlm_eval.py``). ``None`` if the
+    predicted coin box collapses to ~0px (degenerate scale)."""
+    coin_w_px = (parsed["coin_xmax"] - parsed["coin_xmin"]) * image_width_px
+    coin_h_px = (parsed["coin_ymax"] - parsed["coin_ymin"]) * image_height_px
+    if coin_w_px + coin_h_px <= 0:
+        return None
+    scale = 25.0 / ((coin_w_px + coin_h_px) / 2)  # mm per px
+    fruit_w_px = (parsed["fruit_xmax"] - parsed["fruit_xmin"]) * image_width_px
+    fruit_h_px = (parsed["fruit_ymax"] - parsed["fruit_ymin"]) * image_height_px
+    return fruit_w_px * scale, fruit_h_px * scale
+
+
+def bbox_predictions_per_object(
+    attempts: tuple[AttemptRecord, ...],
+    *,
+    model: str,
+    holdout_objects: dict[str, tuple[str, float]],
+    b0_by_type: dict[str, float],
+    kfit: dict[str, float],
+) -> tuple[ObjectPrediction, ...]:
+    """``predictions_per_object``'s BBOX-strategy counterpart
+    (review.md §5 "E1"). Unlike S1/S2/S3, a single (view, variant)
+    BBOX attempt's boxes don't yield a mass estimate on their own — mass
+    needs the top view's (width, height) *and* the side view's height
+    together (the same coin-scaled geometry formula as
+    ``bbox_oracle.py``/``bbox_vlm_eval.py``: ``k * a * b * h`` where
+    ``a=median(max(top w,h))``, ``b=median(min(top w,h))``,
+    ``h=median(side h)``). So this groups by ``(object_key, view)``
+    directly — pooling every variant/repeat within a view, like
+    ``bbox_vlm_eval.py``'s ``vlm_proxy_both`` — rather than reusing
+    ``predictions_per_object``'s per-attempt-pred_g aggregation, which
+    assumes each attempt already carries a complete mass estimate.
+
+    An object missing a usable top+side pair, or whose fruit type has no
+    ``kfit`` entry, gets the B0 fallback, same semantics as
+    ``predictions_per_object``.
+    """
+    wh_mm_by_slot: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    for attempt in attempts:
+        if not (
+            attempt.model == model
+            and attempt.strategy == "BBOX"
+            and attempt.split == "holdout"
+            and attempt.outcome == "ok"
+            and attempt.parsed is not None
+            and attempt.image_width_px is not None
+            and attempt.image_height_px is not None
+            and attempt.object_key in holdout_objects
+        ):
+            continue
+        wh_mm = _box_wh_mm(attempt.parsed, attempt.image_width_px, attempt.image_height_px)
+        if wh_mm is not None:
+            wh_mm_by_slot[(attempt.object_key, attempt.view)].append(wh_mm)
+
+    results = []
+    for object_key, (fruit_type, true_g) in holdout_objects.items():
+        top = wh_mm_by_slot.get((object_key, "top"))
+        side = wh_mm_by_slot.get((object_key, "side"))
+        k = kfit.get(fruit_type)
+        if top and side and k is not None:
+            a = float(np.median([max(w, h) for w, h in top]))
+            b = float(np.median([min(w, h) for w, h in top]))
+            h = float(np.median([wh[1] for wh in side]))
+            pred_g = k * a * b * h
             had_ok = True
         else:
             pred_g = b0_by_type[fruit_type]
@@ -376,14 +493,34 @@ def compute_metrics(
     strategy: str,
     holdout_objects: dict[str, tuple[str, float]],
     b0_by_type: dict[str, float],
+    kfit: dict[str, float] | None = None,
 ) -> ModelStrategyMetrics:
-    predictions = predictions_per_object(
-        attempts,
-        model=model,
-        strategy=strategy,
-        holdout_objects=holdout_objects,
-        b0_by_type=b0_by_type,
-    )
+    """``kfit`` is required (and only used) for ``strategy == "BBOX"``
+    (review.md §5 "E1") — the per-object mass combines both views'
+    boxes via ``bbox_predictions_per_object``, unlike every other
+    strategy's per-attempt ``pred_g``.
+
+    Raises:
+        ValueError: ``strategy == "BBOX"`` without ``kfit``.
+    """
+    if strategy == "BBOX":
+        if kfit is None:
+            raise ValueError('compute_metrics(strategy="BBOX", ...) requires kfit.')
+        predictions = bbox_predictions_per_object(
+            attempts,
+            model=model,
+            holdout_objects=holdout_objects,
+            b0_by_type=b0_by_type,
+            kfit=kfit,
+        )
+    else:
+        predictions = predictions_per_object(
+            attempts,
+            model=model,
+            strategy=strategy,
+            holdout_objects=holdout_objects,
+            b0_by_type=b0_by_type,
+        )
     b0_predictions = tuple(
         ObjectPrediction(p.object_key, p.fruit_type, p.true_g, b0_by_type[p.fruit_type], False)
         for p in predictions
@@ -425,16 +562,30 @@ def passes_gates(metrics: ModelStrategyMetrics) -> bool:
 
 
 def choose_strategy_per_model(
-    metrics_s1: ModelStrategyMetrics, metrics_s3: ModelStrategyMetrics | None
+    metrics_s1: ModelStrategyMetrics,
+    metrics_s3: ModelStrategyMetrics | None,
+    metrics_bbox: ModelStrategyMetrics | None = None,
 ) -> ModelStrategyMetrics:
     """§5: "use S3 instead of S1 only if its MAPE is lower AND β stays in
-    range; otherwise S1."""
-    if metrics_s3 is None:
-        return metrics_s1
+    range; otherwise S1." Generalised to a 3rd candidate, BBOX (not in
+    §5's original rule — review.md §5 "E1"): S1 is always the starting
+    default; each additional candidate, in the order given, replaces the
+    *current* winner only if it has a strictly lower MAPE **and** its
+    own β is in range — never on MAPE alone. This is the exact
+    2-candidate rule applied twice, not a new rule: for any call that
+    only passes ``metrics_s3`` (``metrics_bbox=None``), this is
+    bit-for-bit identical to the original.
+    """
     beta_low, beta_high = _BETA_RANGE
-    if metrics_s3.mape < metrics_s1.mape and beta_low <= metrics_s3.beta <= beta_high:
-        return metrics_s3
-    return metrics_s1
+    winner = metrics_s1
+    for candidate in (metrics_s3, metrics_bbox):
+        if (
+            candidate is not None
+            and candidate.mape < winner.mape
+            and beta_low <= candidate.beta <= beta_high
+        ):
+            winner = candidate
+    return winner
 
 
 def _vendor(model: str) -> str:

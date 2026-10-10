@@ -169,32 +169,80 @@ than §3's "stop and rethink": the architecture the external review
 proposed (VLM localises, code measures) works, at least for this model.
 
 **Claude's 89.3% MAPE is a specific, diagnosed failure, not a second
-counter-example to the architecture.** Its predicted coin box collapses
-in side-view photos specifically: median coin-box aspect ratio 2.29
-(max 3.40) in side views vs. 1.38 in top views, vs. Gemini's tight
-1.2–1.4 in *both* views. A real 25mm coin photographed at a shallow side
-angle foreshortens to an ellipse, not a 2.3:1-elongated rectangle —
-Claude's side-view coin localisation is simply inaccurate, which corrupts
-the mm-per-pixel scale factor and cascades into wildly overestimated
-mass. β=1.14 for Claude too (same as Gemini, both with wide/degenerate
-bootstrap CIs from the small sample) shows it is tracking relative size
-correctly when the scale factor isn't broken — this is a localisation
-reliability problem for this specific model, not evidence against the
-approach.
+counter-example to the architecture** — but this section's original
+diagnosis of *why* was wrong; see §7's correction below.
 
 **Revised recommendation**: do not stop. The direct-mass strategies
 (S1/S3) are the wrong strategy, not evidence that VLM-assisted size
-estimation is infeasible. Before Phase 0:
+estimation is infeasible. See §7's revised next-steps list.
 
-1. Confirm Gemini's box-then-compute result holds on a second,
-   independent image set (own-photo transfer, `review.md`'s E6) — this
-   pre-study's 23-25 hold-out objects is still a small sample, and the
-   dev-fitted `k` constants are specific to this dataset's camera
-   distance/framing.
-2. Investigate whether Claude's side-view coin localisation improves
-   with a prompt change (e.g. asking explicitly for the coin's two
-   semi-axes under foreshortening) before concluding it's unusable — not
-   yet attempted.
-3. The §4 "wider weight spread" diagnostic is no longer the priority
-   question it was under the resolution-floor hypothesis; §6 already
-   answers "is there a resolvable signal" (yes, via localisation).
+## 7. Second correction (2026-10-10): §6's "foreshortened coin" diagnosis was factually wrong, and E1 is now a formal, reproducible pipeline strategy
+
+A second external review of §6 corrected the claimed mechanism and
+changed the priority order of what to do next. Both corrections were
+independently re-verified against the real ground-truth annotation XML
+(not taken on faith) before acting on them.
+
+**The coin does not foreshorten to an ellipse in side-view photos — this
+was checked and is false.** Ground-truth coin-box aspect ratio across
+all 1,422 side-view and 1,421 top-view annotations: median 1.050 (side),
+1.044 (top), p10–p90 of 1.01–1.12 in both. The coin reads as
+near-circular in *every* real photo, side or top. Claude's VLM-predicted
+median aspect ratio of 2.29 in side views is therefore a genuine
+localisation or coordinate-convention bug, not a physical effect — §6's
+explanation is retracted. The review's working hypothesis: different
+providers are trained on different "native" box conventions (e.g.
+Gemini's `[ymin,xmin,ymax,xmax]`-on-1000 vs. pixel coordinates with an
+explicit image size), and asking every model for the same shared `[0,1]`
+fraction format may systematically penalise models whose native
+convention differs — not yet tested; see the next-steps list below.
+
+**"E1" is no longer a one-off script result — it's now computed by the
+same formal `analysis.py`/`report.py`/`decide()` pipeline S1/S3 already
+used** (`analysis.bbox_predictions_per_object`, `compute_metrics(...,
+strategy="BBOX", kfit=...)`, `choose_strategy_per_model` generalised to
+a 3rd candidate). This needed two additions the original E1 script
+didn't have: `run.ResultRecord` now persists `image_width_px`/
+`image_height_px` at run time (no more re-deriving dimensions from raw
+image files at analysis time), and the ground-truth-fitted per-type `k`
+is a committed artifact (`bench/scripts/fit_k.py` → `kfit.json`), not
+recomputed from the Annotations directory on every analysis run. The
+existing 100 real `BBOX` rows (from before these fields existed) were
+backfilled in place (`bench/scripts/backfill_image_dims.py`,
+sha256-verified against the actual sent bytes, 100/100 recovered) rather
+than discarded or re-paid-for.
+
+Running the real pipeline on the real, backfilled data reproduces §6's
+numbers exactly and now auto-generates a decision:
+
+| Model | Strategy | n | MAPE | Gain vs B0 | β | Bias | Validity |
+|---|---|---|---|---|---|---|---|
+| `google/gemini-3.5-flash` | BBOX | 25 | 0.119 | 40.2% | 1.14 | +0.8% | 100.0% |
+| `anthropic/claude-sonnet-4.6` | S1 | 25 | 0.277 | -39.0% | 0.17 | -0.7% | 100.0% |
+
+**Decision: default `google/gemini-3.5-flash` (BBOX)** — passes every
+§5 gate (gain ≥30%, β∈[0.7,1.3], |bias|≤10%, validity ≥98%). No
+fallback: Claude's BBOX metrics exist but lose to its own S1 on MAPE
+(`choose_strategy_per_model` picks S1 for Claude), and Claude's S1 fails
+the gain/β gates, so no second vendor passes. This is the formal
+pipeline's own output, not a hand-edited `decision.md`.
+
+**Revised next steps, in order** (supersedes §5 and §6's lists):
+
+1. Investigate Claude's (and, once its rate limit clears, Qwen3-VL's)
+   box coordinates in their own native convention rather than the
+   shared `[0,1]` fraction format, converting to a common representation
+   in code — not yet attempted; the current `[0,1]`-for-everyone schema
+   is unchanged pending this.
+2. Re-run E1 across all photo variants (`--max-variants-per-object
+   all`, already implemented per §E3) rather than one variant per
+   (object, view) — cheap, not yet done for BBOX specifically.
+3. Fit `k` per model from that model's own dev-split BBOX predictions
+   (not just the one ground-truth-fit reference value) — corrects
+   systematic box bias per model; needs dev-split BBOX attempts, which
+   the current hold-out-only sweep doesn't have. Documented as a real
+   gap, not implemented.
+4. Own-photo transfer check with a real card (review's E6) — the
+   dev-fitted `k` is specific to this dataset's camera distance/coin and
+   won't carry over; needs real photos only the product's actual user
+   can supply.

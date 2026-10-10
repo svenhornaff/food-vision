@@ -22,13 +22,22 @@ htmlcov/
 # Logs (none written by default; reserved for future opt-in file logging)
 logs/
 
-# Pre-study run outputs (docs/dev/pre-study.md §9): results.jsonl and
-# anything else under bench/runs/ is regenerable; keep split.csv (the
-# committed dev/holdout assignment) and models.toml (capability notes).
+# Pre-study run outputs (docs/dev/pre-study.md §9). Most of bench/runs/
+# is regenerable and gitignored; these are committed because they're the
+# actual paid-for evidence the report/decision are based on (no images
+# or secrets in any of them -- verified before committing):
+#   split.csv      the committed dev/holdout assignment
+#   models.toml    per-model capability/pin notes
+#   results.jsonl  every real OpenRouter attempt (review.md §5: "it
+#                  holds no images or secrets; commit it")
+#   kfit.json      the ground-truth-box-fitted per-type mass constant
+#                  (bench/scripts/fit_k.py) the "BBOX" strategy needs
 bench/runs/**
 !bench/runs/**/
 !bench/runs/**/split.csv
 !bench/runs/**/models.toml
+!bench/runs/**/results.jsonl
+!bench/runs/**/kfit.json
 
 # Raw third-party dataset clones (large, licensed separately, fetched on
 # demand — see docs/dev/pre-study.md for provenance/citation requirements)

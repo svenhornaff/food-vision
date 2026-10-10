@@ -181,6 +181,8 @@ class TestAppendResult:
             true_g=200.0,
             pred_g=190.0,
             parsed={"observations": "a medium apple", "mass_g": 190.0},
+            image_width_px=1024,
+            image_height_px=768,
             outcome="ok",
             model_resolved="m-v2",
             generation_id="gen-1",

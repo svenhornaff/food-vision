@@ -267,6 +267,8 @@ class TestCmdAnalyze:
                 str(split_csv),
                 "--out-dir",
                 str(out_dir),
+                "--kfit",
+                str(tmp_path / "no-kfit-here.json"),
             ]
         )
 
@@ -274,3 +276,87 @@ class TestCmdAnalyze:
         assert (out_dir / "report.md").exists()
         assert (out_dir / "scatter.png").exists()
         assert (out_dir / "decision.md").exists()
+
+    def test_bbox_strategy_included_when_kfit_present(self, tmp_path: Path) -> None:
+        """End-to-end: a BBOX row + a committed kfit.json both feed into
+        the decision, same as S1/S3 (review.md §5 "E1" integration)."""
+        split_csv = tmp_path / "split.csv"
+        split_csv.write_text(
+            "object_key,fruit_type,view,image_file,weight_g,split,variant\n"
+            "a,apple,top,a.JPG,100.0,dev,1\n"
+            "b,apple,top,b.JPG,750.0,holdout,1\n"
+            "b,apple,side,b2.JPG,750.0,holdout,1\n"
+            "c,apple,top,c.JPG,1562.5,holdout,1\n"
+            "c,apple,side,c2.JPG,1562.5,holdout,1\n"
+        )
+        kfit_path = tmp_path / "kfit.json"
+        kfit_path.write_text(json.dumps({"apple": 0.001}))
+
+        def _bbox_row(
+            object_key: str,
+            true_g: float,
+            view: str,
+            fruit_box: tuple[float, float, float, float],
+        ) -> dict[str, Any]:
+            return {
+                "key": f"vendor/a|BBOX|hash-{object_key}-{view}|0",
+                "model": "vendor/a",
+                "provider": "p",
+                "strategy": "BBOX",
+                "repeat": 0,
+                "object_key": object_key,
+                "fruit_type": "apple",
+                "view": view,
+                "split": "holdout",
+                "true_g": true_g,
+                "pred_g": None,
+                "outcome": "ok",
+                "cost_usd": 0.001,
+                "latency_ms": 100.0,
+                "parsed": {
+                    "observations": "x",
+                    "coin_xmin": 0.0,
+                    "coin_ymin": 0.0,
+                    "coin_xmax": 0.1,
+                    "coin_ymax": 0.1,
+                    "fruit_xmin": fruit_box[0],
+                    "fruit_ymin": fruit_box[1],
+                    "fruit_xmax": fruit_box[2],
+                    "fruit_ymax": fruit_box[3],
+                },
+                "image_width_px": 1000,
+                "image_height_px": 1000,
+            }
+
+        rows = [
+            # b: k*a*b*h = 0.001*100*75*100 = 750.0 == true_g (perfect fit)
+            _bbox_row("b", 750.0, "top", (0.1, 0.2, 0.5, 0.5)),  # 100mm x 75mm
+            _bbox_row("b", 750.0, "side", (0.1, 0.2, 0.5, 0.6)),  # 100mm x 100mm
+            # c: k*a*b*h = 0.001*125*100*125 = 1562.5 == true_g (perfect fit,
+            # different magnitude -> beta is computable, not nan/degenerate)
+            _bbox_row("c", 1562.5, "top", (0.1, 0.2, 0.6, 0.6)),  # 125mm x 100mm
+            _bbox_row("c", 1562.5, "side", (0.1, 0.2, 0.6, 0.7)),  # 125mm x 125mm
+        ]
+        results = tmp_path / "results.jsonl"
+        results.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+        out_dir = tmp_path / "report"
+        exit_code = cli.main(
+            [
+                "analyze",
+                "--results",
+                str(results),
+                "--split-csv",
+                str(split_csv),
+                "--out-dir",
+                str(out_dir),
+                "--kfit",
+                str(kfit_path),
+            ]
+        )
+
+        assert exit_code == 0
+        decision_text = (out_dir / "decision.md").read_text()
+        # k*a*b*h = 0.001*100*75*100 = 750.0 == true_g -> a perfect-fit
+        # BBOX prediction, which must win over the (absent) S1/S3 data.
+        assert "BBOX" in decision_text

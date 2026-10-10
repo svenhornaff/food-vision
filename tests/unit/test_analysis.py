@@ -14,6 +14,7 @@ from food_vision.prestudy.analysis import (
     AttemptRecord,
     ModelStrategyMetrics,
     ObjectPrediction,
+    bbox_predictions_per_object,
     bootstrap_mape_diff_ci,
     choose_strategy_per_model,
     compute_b0,
@@ -22,6 +23,7 @@ from food_vision.prestudy.analysis import (
     decide,
     geometric_bias,
     latency_percentiles,
+    load_kfit,
     load_results,
     mape,
     passes_gates,
@@ -48,6 +50,9 @@ def _attempt(
     cost_usd: float | None = 0.001,
     latency_ms: float = 100.0,
     variant: int = 1,
+    parsed: dict[str, object] | None = None,
+    image_width_px: int | None = None,
+    image_height_px: int | None = None,
 ) -> AttemptRecord:
     return AttemptRecord(
         model=model,
@@ -63,6 +68,9 @@ def _attempt(
         cost_usd=cost_usd,
         latency_ms=latency_ms,
         variant=variant,
+        parsed=parsed,
+        image_width_px=image_width_px,
+        image_height_px=image_height_px,
     )
 
 
@@ -581,3 +589,308 @@ class TestDecide:
 
         assert decision.default_model == "vendor-a/x"
         assert decision.fallback_model is None
+
+
+def _box(xmin: float, ymin: float, xmax: float, ymax: float, *, prefix: str) -> dict[str, float]:
+    return {
+        f"{prefix}_xmin": xmin,
+        f"{prefix}_ymin": ymin,
+        f"{prefix}_xmax": xmax,
+        f"{prefix}_ymax": ymax,
+    }
+
+
+def _bbox_parsed(
+    *, coin: tuple[float, float, float, float], fruit: tuple[float, float, float, float]
+) -> dict[str, object]:
+    return {"observations": "x", **_box(*coin, prefix="coin"), **_box(*fruit, prefix="fruit")}
+
+
+class TestLoadKfit:
+    def test_round_trips_valid_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "kfit.json"
+        path.write_text(json.dumps({"apple": 0.0004, "banana": 0.0003}))
+
+        assert load_kfit(path) == {"apple": 0.0004, "banana": 0.0003}
+
+    def test_rejects_non_object_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "kfit.json"
+        path.write_text("[1, 2, 3]")
+
+        with pytest.raises(ValueError, match="JSON object"):
+            load_kfit(path)
+
+    def test_rejects_malformed_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "kfit.json"
+        path.write_text("not json")
+
+        with pytest.raises(ValueError, match="not valid JSON"):
+            load_kfit(path)
+
+    def test_missing_file_raises_oserror(self, tmp_path: Path) -> None:
+        with pytest.raises(OSError):
+            load_kfit(tmp_path / "missing.json")
+
+
+class TestBboxPredictionsPerObject:
+    #: A coin exactly 100x100px in a 1000x1000px image scales 1px = 0.25mm
+    #: (25mm / 100px); a fruit box 400x300px frac (0.1..0.5, 0.2..0.5) is
+    #: then 400px*0.25=100mm wide, 300px*0.25=75mm tall.
+    _COIN = (0.0, 0.0, 0.1, 0.1)
+    _TOP_FRUIT = (0.1, 0.2, 0.5, 0.5)  # -> w=100mm, h=75mm (top: a=100,b=75)
+    _SIDE_FRUIT = (0.1, 0.2, 0.5, 0.6)  # -> w=100mm, h=100mm (side: h=100)
+
+    def test_combines_top_and_side_into_one_object_prediction(self) -> None:
+        attempts = (
+            _attempt(
+                strategy="BBOX",
+                view="top",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._TOP_FRUIT),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+            _attempt(
+                strategy="BBOX",
+                view="side",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._SIDE_FRUIT),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+        )
+        holdout_objects = {"apple001": ("apple", 200.0)}
+
+        predictions = bbox_predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            holdout_objects=holdout_objects,
+            b0_by_type={"apple": 999.0},
+            kfit={"apple": 0.001},
+        )
+
+        assert len(predictions) == 1
+        prediction = predictions[0]
+        assert prediction.had_ok_result is True
+        # k * a * b * h = 0.001 * 100 * 75 * 100 = 750.0
+        assert prediction.pred_g == pytest.approx(750.0)
+
+    def test_b0_fallback_when_one_view_missing(self) -> None:
+        attempts = (
+            _attempt(
+                strategy="BBOX",
+                view="top",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._TOP_FRUIT),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+        )
+        holdout_objects = {"apple001": ("apple", 200.0)}
+
+        predictions = bbox_predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            holdout_objects=holdout_objects,
+            b0_by_type={"apple": 150.0},
+            kfit={"apple": 0.001},
+        )
+
+        assert predictions[0].had_ok_result is False
+        assert predictions[0].pred_g == pytest.approx(150.0)
+
+    def test_b0_fallback_when_fruit_type_missing_from_kfit(self) -> None:
+        attempts = (
+            _attempt(
+                strategy="BBOX",
+                view="top",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._TOP_FRUIT),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+            _attempt(
+                strategy="BBOX",
+                view="side",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._SIDE_FRUIT),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+        )
+        holdout_objects = {"apple001": ("apple", 200.0)}
+
+        predictions = bbox_predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            holdout_objects=holdout_objects,
+            b0_by_type={"apple": 150.0},
+            kfit={},  # no "apple" entry
+        )
+
+        assert predictions[0].had_ok_result is False
+        assert predictions[0].pred_g == pytest.approx(150.0)
+
+    def test_degenerate_coin_box_is_skipped(self) -> None:
+        degenerate_coin_parsed = _bbox_parsed(coin=(0.1, 0.1, 0.1, 0.1), fruit=self._TOP_FRUIT)
+        attempts = (
+            _attempt(
+                strategy="BBOX",
+                view="top",
+                outcome="ok",
+                pred_g=None,
+                parsed=degenerate_coin_parsed,
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+            _attempt(
+                strategy="BBOX",
+                view="side",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._SIDE_FRUIT),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+        )
+        holdout_objects = {"apple001": ("apple", 200.0)}
+
+        predictions = bbox_predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            holdout_objects=holdout_objects,
+            b0_by_type={"apple": 150.0},
+            kfit={"apple": 0.001},
+        )
+
+        # top's box is degenerate (zero-width coin box) -> no usable "top"
+        # slot at all -> falls back to B0, same as a missing view.
+        assert predictions[0].had_ok_result is False
+        assert predictions[0].pred_g == pytest.approx(150.0)
+
+    def test_ignores_non_ok_and_missing_dims(self) -> None:
+        attempts = (
+            _attempt(
+                strategy="BBOX",
+                view="top",
+                outcome="invalid",
+                pred_g=None,
+                parsed=None,
+                image_width_px=None,
+                image_height_px=None,
+            ),
+            _attempt(
+                strategy="BBOX",
+                view="side",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=self._COIN, fruit=self._SIDE_FRUIT),
+                image_width_px=None,  # pre-E1-field row; no dims to convert with
+                image_height_px=None,
+            ),
+        )
+        holdout_objects = {"apple001": ("apple", 200.0)}
+
+        predictions = bbox_predictions_per_object(
+            attempts,
+            model="vendor/model-a",
+            holdout_objects=holdout_objects,
+            b0_by_type={"apple": 150.0},
+            kfit={"apple": 0.001},
+        )
+
+        assert predictions[0].had_ok_result is False
+        assert predictions[0].pred_g == pytest.approx(150.0)
+
+
+class TestComputeMetricsBbox:
+    def test_requires_kfit(self) -> None:
+        with pytest.raises(ValueError, match="requires kfit"):
+            compute_metrics(
+                (),
+                model="vendor/model-a",
+                strategy="BBOX",
+                holdout_objects={},
+                b0_by_type={},
+            )
+
+    def test_happy_path_uses_bbox_aggregation(self) -> None:
+        coin = TestBboxPredictionsPerObject._COIN
+        top_fruit = TestBboxPredictionsPerObject._TOP_FRUIT
+        side_fruit = TestBboxPredictionsPerObject._SIDE_FRUIT
+        attempts = (
+            _attempt(
+                strategy="BBOX",
+                view="top",
+                object_key="apple001",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=coin, fruit=top_fruit),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+            _attempt(
+                strategy="BBOX",
+                view="side",
+                object_key="apple001",
+                outcome="ok",
+                pred_g=None,
+                parsed=_bbox_parsed(coin=coin, fruit=side_fruit),
+                image_width_px=1000,
+                image_height_px=1000,
+            ),
+        )
+        holdout_objects = {"apple001": ("apple", 750.0)}
+
+        metrics = compute_metrics(
+            attempts,
+            model="vendor/model-a",
+            strategy="BBOX",
+            holdout_objects=holdout_objects,
+            b0_by_type={"apple": 999.0},
+            kfit={"apple": 0.001},
+        )
+
+        assert metrics.n_objects == 1
+        assert metrics.mape == pytest.approx(0.0)  # true_g chosen == predicted 750.0
+
+
+class TestChooseStrategyPerModelWithBbox:
+    def test_bbox_chosen_when_better_than_s1_and_s3(self) -> None:
+        s1 = _metrics(strategy="S1", mape_value=0.3, beta=0.3)
+        s3 = _metrics(strategy="S3", mape_value=0.25, beta=0.4)
+        bbox = _metrics(strategy="BBOX", mape_value=0.12, beta=1.1)
+
+        assert choose_strategy_per_model(s1, s3, bbox) is bbox
+
+    def test_bbox_ignored_when_beta_out_of_range_even_if_mape_lower(self) -> None:
+        s1 = _metrics(strategy="S1", mape_value=0.3, beta=1.0)
+        bbox = _metrics(strategy="BBOX", mape_value=0.1, beta=2.0)
+
+        assert choose_strategy_per_model(s1, None, bbox) is s1
+
+    def test_two_arg_call_is_unaffected_by_bbox_default(self) -> None:
+        s1 = _metrics(strategy="S1", mape_value=0.2, beta=1.0)
+        s3 = _metrics(strategy="S3", mape_value=0.1, beta=1.0)
+
+        assert choose_strategy_per_model(s1, s3) is s3
+
+    def test_neither_s3_nor_bbox_beta_in_range_keeps_s1_despite_lower_mape(self) -> None:
+        """Regression guard for the edge case a naive "just pick lowest
+        MAPE among all candidates, falling back to beta-in-range-or-not"
+        generalisation would get wrong: when nothing is beta-in-range,
+        S1 must stay the winner even though another candidate has a
+        lower MAPE — matching the original 2-candidate rule's behaviour
+        exactly (it only ever *replaces* S1, conditioned on beta; it
+        never falls back to "pick the global lowest MAPE regardless".
+        """
+        s1 = _metrics(strategy="S1", mape_value=0.3, beta=2.0)
+        s3 = _metrics(strategy="S3", mape_value=0.2, beta=2.0)
+        bbox = _metrics(strategy="BBOX", mape_value=0.1, beta=0.1)
+
+        assert choose_strategy_per_model(s1, s3, bbox) is s1
